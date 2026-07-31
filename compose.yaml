@@ -6,19 +6,18 @@ services:
     build:
       context: ./peek-server
     image: peek-server:local
-    restart: unless-stopped
+    restart: on-failure:3
 
-    # Harden the container itself.
+    # Harden container
     read_only: true
     user: "10001:10001"
-    userns_mode: "keep-id:uid=10001,gid=10001"
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
 
-    # Some Python/runtime components expect a writable temporary directory.
+    # Some Python/runtime components expect a writable temporary directory
     tmpfs:
       - /tmp:size=16m,mode=1777
 
@@ -34,7 +33,10 @@ services:
       start_period: 5s
 
     volumes:
-      - "${PEEK_PROJECT_PATH}:/workspace:ro,Z"
+      - "${PEEK_PROJECT_PATH}/peek-server:/workspace/peek-server:ro,Z"
+      - "${PEEK_PROJECT_PATH}/.env.example:/workspace/.env.example:ro,Z"
+      - "${PEEK_PROJECT_PATH}/.gitignore:/workspace/.gitignore:ro,Z"
+      - "${PEEK_PROJECT_PATH}/compose.yaml:/workspace/compose.yaml:ro,Z"
 
     # The server has no egress-capable network.
     networks:
@@ -48,10 +50,9 @@ services:
       context: "https://github.com/openai/tunnel-client.git#${TUNNEL_CLIENT_VERSION:-v0.0.10}"
       args:
         GIT_SHA: ${TUNNEL_CLIENT_VERSION:-v0.0.10}
-        GOPROXY: https://proxy.golang.org
 
     image: peek-tunnel:local
-    restart: unless-stopped
+    restart: on-failure:3
 
     depends_on:
       peek-server:
