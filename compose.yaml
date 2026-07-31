@@ -1,0 +1,97 @@
+name: peek
+
+services:
+  peek-server:
+    container_name: peek-server
+    build:
+      context: ./peek-server
+    image: peek-server:local
+    restart: unless-stopped
+
+    # Harden the container itself.
+    read_only: true
+    user: "10001:10001"
+    userns_mode: "keep-id:uid=10001,gid=10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+
+    # Some Python/runtime components expect a writable temporary directory.
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+    volumes:
+      - "${PEEK_PROJECT_PATH}:/workspace:ro,Z"
+
+    # The server has no egress-capable network.
+    networks:
+      - peek-backend
+
+  peek-tunnel:
+    container_name: peek-tunnel
+
+    # Build the official OpenAI source at a pinned release tag.
+    build:
+      context: "https://github.com/openai/tunnel-client.git#${TUNNEL_CLIENT_VERSION:-v0.0.10}"
+      args:
+        GIT_SHA: ${TUNNEL_CLIENT_VERSION:-v0.0.10}
+        GOPROXY: https://proxy.golang.org
+
+    image: peek-tunnel:local
+    restart: unless-stopped
+
+    depends_on:
+      peek-server:
+        condition: service_healthy
+
+    read_only: true
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+
+    environment:
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      HOME: /tmp
+      CONTROL_PLANE_API_KEY: ${PEEK_CONTROL_PLANE_API_KEY:?Set PEEK_CONTROL_PLANE_API_KEY in .env}
+
+    # The upstream image entrypoint is:
+    #   tunnel-client run
+    command:
+      - --control-plane.api-key=env:CONTROL_PLANE_API_KEY
+      - --control-plane.tunnel-id=${PEEK_TUNNEL_ID:?Set PEEK_TUNNEL_ID in .env}
+      - --mcp.server-url=http://peek-server:8000/mcp
+
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    networks:
+      # Private access to the MCP server.
+      - peek-backend
+
+      # Outbound HTTPS access to OpenAI.
+      - peek-egress
+
+networks:
+  # Containers on this network cannot use it for external connectivity.
+  peek-backend:
+    internal: true
+
+  # Only peek-tunnel joins this network.
+  peek-egress: {}
