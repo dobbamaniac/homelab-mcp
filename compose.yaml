@@ -4,7 +4,7 @@ services:
   peek-server:
     container_name: peek-server
     build:
-      context: ./peek-server
+      context: .
     image: peek-server:local
     restart: on-failure:3
 
