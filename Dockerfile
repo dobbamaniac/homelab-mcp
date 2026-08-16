@@ -1,23 +1,25 @@
-FROM python:3.13-alpine3.22
+FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PEEK_ROOT=/workspace
-
-RUN addgroup -S -g 10001 peek \
-    && adduser -S -D -H -u 10001 -G peek peek
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install \
-    --no-cache-dir \
-    --disable-pip-version-check \
-    -r requirements.txt
+RUN groupadd --gid 10001 mcp \
+    && useradd \
+        --uid 10001 \
+        --gid 10001 \
+        --no-create-home \
+        --shell /usr/sbin/nologin \
+        mcp
 
-COPY --chown=10001:10001 server.py ./
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-USER 10001:10001
+COPY --chown=mcp:mcp server.py .
+
+USER mcp:mcp
 
 EXPOSE 8000
 
