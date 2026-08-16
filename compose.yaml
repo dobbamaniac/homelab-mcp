@@ -1,25 +1,29 @@
-name: peek
+name: peek-mcp
 
 services:
   peek-server:
     container_name: peek-server
-    build:
-      context: .
+    build: .
     image: peek-server:local
     restart: on-failure:3
 
-    # Harden container
     read_only: true
-    user: "10001:10001"
+    user: "${PEEK_UID:-10001}:${PEEK_GID:-10001}"
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
 
-    # Some Python/runtime components expect a writable temporary directory
+    environment:
+      HOME: /tmp
+      PEEK_ROOT: /workspace
+
     tmpfs:
       - /tmp:size=16m,mode=1777
+
+    volumes:
+      - "${PEEK_WORKSPACE_PATH:?Set PEEK_WORKSPACE_PATH}:/workspace:ro,Z"
 
     healthcheck:
       test:
@@ -32,20 +36,12 @@ services:
       retries: 5
       start_period: 5s
 
-    volumes:
-      - "${PEEK_PROJECT_PATH}/peek-server:/workspace/peek-server:ro,Z"
-      - "${PEEK_PROJECT_PATH}/.env.example:/workspace/.env.example:ro,Z"
-      - "${PEEK_PROJECT_PATH}/.gitignore:/workspace/.gitignore:ro,Z"
-      - "${PEEK_PROJECT_PATH}/compose.yaml:/workspace/compose.yaml:ro,Z"
-
-    # The server has no egress-capable network.
     networks:
       - peek-backend
 
   peek-tunnel:
     container_name: peek-tunnel
 
-    # Build the official OpenAI source at a pinned release tag.
     build:
       context: "https://github.com/openai/tunnel-client.git#${TUNNEL_CLIENT_VERSION:-v0.0.10}"
       args:
@@ -72,8 +68,6 @@ services:
       HOME: /tmp
       CONTROL_PLANE_API_KEY: ${PEEK_CONTROL_PLANE_API_KEY:?Set PEEK_CONTROL_PLANE_API_KEY in .env}
 
-    # The upstream image entrypoint is:
-    #   tunnel-client run
     command:
       - --control-plane.api-key=env:CONTROL_PLANE_API_KEY
       - --control-plane.tunnel-id=${PEEK_TUNNEL_ID:?Set PEEK_TUNNEL_ID in .env}
@@ -83,16 +77,11 @@ services:
       - /tmp:size=16m,mode=1777
 
     networks:
-      # Private access to the MCP server.
       - peek-backend
-
-      # Outbound HTTPS access to OpenAI.
       - peek-egress
 
 networks:
-  # Containers on this network cannot use it for external connectivity.
   peek-backend:
     internal: true
 
-  # Only peek-tunnel joins this network.
   peek-egress: {}

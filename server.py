@@ -1,181 +1,171 @@
 from __future__ import annotations
 
-import fnmatch
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
+# Get PEEK_ROOT environment variable, default to "/workspace"
+# Resolve to a file path which strictly must exist
+ROOT = Path(os.getenv("PEEK_ROOT", "/workspace")).resolve(strict=True)
 
-ROOT = Path(os.environ.get("PEEK_ROOT", "/workspace")).resolve(strict=True)
+MAX_SEARCH_DEPTH = 5                # Max depth of directory search
+MAX_FILES_LISTED=500                # Max number of files to be listed from a directory search
+MAX_SEARCH_FILE_BYTES = 1_000_000   # Max size of searchable files
+MAX_SEARCH_RESULTS = 50             # Max number of search results within a file
+MAX_READ_LINES = 400                # Max number of lines to be read from a file at once
+MAX_OUTPUT_LINE_CHARS = 500         # Max characters per output line
 
-MAX_READ_LINES = 400
-MAX_SEARCH_RESULTS = 50
-MAX_SEARCH_FILE_BYTES = 1_000_000
-MAX_OUTPUT_LINE_CHARS = 500
-
-
-# This deny list is an additional precaution, not a replacement for mounting
-# only files that are safe to disclose.
-DENY_PATTERNS = tuple(
-    pattern.strip()
-    for pattern in os.environ.get(
-        "PEEK_DENY",
-        ".git,.git/**,.env,.env.*,secrets,secrets/**,*.pem,*.key",
-    ).split(",")
-    if pattern.strip()
+# File path patterns that will be denied
+DENY_PATTERNS = (
+    ".git",
+    ".git/**",
+    ".env",
+    "*.env",
+    "secrets",
+    "secrets/**",
+    "*.pem",
+    "*.key",
 )
 
-
-# These annotations tell MCP clients that every exposed operation is local
-# and read-only. The actual read-only guarantees still come from the code,
-# mount configuration, and container restrictions.
+# Describes tools to MCP clients
 READ_ONLY = ToolAnnotations(
-    readOnlyHint=True,
-    destructiveHint=False,
-    openWorldHint=False,
+    readOnlyHint=True,          # Tool is read-only
+    destructiveHint=False,      # Tool is non-destructive
+    idempotentHint=True,        # Repeatedly calling on same input has no side effects
+    openWorldHint=False,        # Tool doesn't interact with external systems or public internet
 )
 
-
-mcp = FastMCP(
+# Create MCP server
+mcp = MCPServer(
     "Peek",
     instructions=(
         "Read-only access to a mounted source tree. "
-        "Prefer narrow reads and searches. "
-        "Never claim that Peek can modify files or execute commands."
+        "Prefer narrow reads and searches."
     ),
-    host="0.0.0.0",
-    port=8000,
-    stateless_http=True,
-    json_response=True,
 )
 
 
-def _relative(path: Path) -> PurePosixPath:
-    """Return a path relative to the mounted project root."""
-    return PurePosixPath(path.relative_to(ROOT).as_posix())
+def _relative(path: Path) -> Path:
+    """Return a path relative to the workspace root."""
+    return path.relative_to(ROOT)
 
 
-def _is_denied(relative_path: PurePosixPath) -> bool:
-    """Return whether a project-relative path matches a denied pattern."""
-    value = relative_path.as_posix()
-
-    return any(
-        fnmatch.fnmatchcase(value, pattern)
-        or relative_path.match(pattern)
-        for pattern in DENY_PATTERNS
-    )
+def _is_denied(path: Path) -> bool:
+    """Return True if a relative path matches the deny list."""
+    return any(path.match(pattern) for pattern in DENY_PATTERNS)
 
 
-def _resolve(user_path: str, *, must_exist: bool = True) -> Path:
-    """
-    Resolve a user-supplied project-relative path.
+def _resolve(user_path: str) -> Path:
+    """Resolve a project-relative path without allowing escape from ROOT."""
+    # Check if path is empty or contains NUL-byte
+    if not user_path or "\0" in user_path:
+        raise ValueError("path must be non-empty")
 
-    Absolute paths, parent traversal, symlink escapes, and denied paths are
-    rejected.
-    """
-    if not user_path or "\x00" in user_path:
-        raise ValueError("path must be a non-empty string")
+    # Construct path relative to /workspace
+    relative_path = Path(user_path)
 
-    raw_path = Path(user_path)
-
-    if raw_path.is_absolute() or ".." in raw_path.parts:
+    # Check if path is absolute or contains '..'
+    if relative_path.is_absolute() or ".." in relative_path.parts:
         raise ValueError("path must be relative and may not contain '..'")
 
-    candidate = (ROOT / raw_path).resolve(strict=must_exist)
+    # Check if path is denied
+    if _is_denied(relative_path):
+        raise PermissionError(f"access denied: {relative_path}")
 
+    # Attempt to resolve path against /workspace
+    resolved_path = (ROOT / relative_path).resolve(strict=True)
+    
+    # Check if resolved path escapes the workspace
     try:
-        relative = _relative(candidate)
-    except ValueError as exc:
-        raise ValueError("path escapes the mounted project root") from exc
+        resolved_relative = _relative(resolved_path)
+    except ValueError:
+        raise ValueError("path escapes the workspace") from None
 
-    if _is_denied(relative):
-        raise PermissionError(
-            f"access denied by PEEK_DENY: {relative}"
-        )
+    # Check if resolved path is denied to safeguard against escaping symlinks
+    if _is_denied(resolved_relative):
+        raise PermissionError(f"access denied: {resolved_relative}")
 
-    return candidate
+    return resolved_path
 
 
 def _display(path: Path) -> str:
-    """Return a user-facing project-relative path."""
-    relative = _relative(path).as_posix()
-    return relative if relative != "." else "."
+    """Return a project-relative path for tool output."""
+    relative_path = _relative(path).as_posix()
+
+    # Return "." if path is empty
+    return relative_path or "."     
 
 
-def _looks_binary(path: Path) -> bool:
-    """Use a small NUL-byte check to reject probable binary files."""
-    with path.open("rb") as handle:
-        return b"\x00" in handle.read(4096)
+def _binary(path: Path) -> bool:
+    """Reject probable binary files using a small NUL-byte check."""
+    # Use NUL-byte appearing in first 4KiB as heuristic for binary files
+    with path.open("rb") as file:
+        return b"\0" in file.read(4096)
 
-
-@mcp.tool(
-    title="List source files",
-    description=(
-        "List files and directories below a project-relative path. "
-        "Results are bounded and never follow directory symlinks."
-    ),
-    annotations=READ_ONLY,
-)
+# Expose this function as a read-only tool to MCP server
+@mcp.tool(annotations=READ_ONLY)
 def list_files(
     path: str = ".",
     max_depth: int = 2,
     limit: int = 200,
 ) -> str:
-    """List a bounded portion of the mounted project tree."""
-    base = _resolve(path)
+    """List files and directories below a project-relative path.
 
-    if not base.is_dir():
-        raise ValueError(f"not a directory: {_display(base)}")
+    Results are bounded and directory symlinks are never followed.
+    """
+    # Safely resolve path
+    base_dir = _resolve(path)
 
-    if not 0 <= max_depth <= 5:
-        raise ValueError("max_depth must be between 0 and 5")
+    # Assert resolved path is a directory
+    if not base_dir.is_dir():
+        raise ValueError(f"not a directory: {_display(base_dir)}")
 
-    if not 1 <= limit <= 500:
-        raise ValueError("limit must be between 1 and 500")
+    # Assert search depth is within bounds
+    if not 0 <= max_depth <= MAX_SEARCH_DEPTH:
+        raise ValueError(f"max_depth must be between 0 and {MAX_SEARCH_DEPTH}")
 
+    # Assert file limit is within bounds
+    if not 1 <= limit <= MAX_FILES_LISTED:
+        raise ValueError(f"limit must be between 1 and {MAX_FILES_LISTED}")
+
+    # Allocate results list
     results: list[str] = []
 
-    for current_text, directories, files in os.walk(
-        base,
-        followlinks=False,
-    ):
-        current = Path(current_text)
-        depth = len(current.relative_to(base).parts)
+    # Recursively traverse directory, ignoring symlinks 
+    for current, directories, files in base_dir.walk(follow_symlinks=False):
+        depth = len(current.relative_to(base_dir).parts)
 
-        allowed_directories: list[str] = []
-
-        for name in sorted(directories):
-            child = current / name
-            relative = _relative(child)
-
-            if not _is_denied(relative):
-                allowed_directories.append(name)
-
-        # Prevent os.walk from descending beyond the requested depth.
-        directories[:] = (
-            allowed_directories
-            if depth < max_depth
-            else []
+        # Prevent traversal into denied directories
+        # We have to modify `directories` in place since `Path.walk()` holds a reference
+        directories[:] = sorted(
+            name
+            for name in directories
+            if not _is_denied(_relative(current / name))
         )
+        
+        # Prevent traversal past `max_depth`
+        if depth >= max_depth:
+            directories.clear()
 
-        if current != base:
+        # Append current directory to results
+        if current != base_dir:
             results.append(f"{_display(current)}/")
 
             if len(results) >= limit:
                 break
 
+        # Append files to results
         for name in sorted(files):
             child = current / name
+            relative = _relative(child)
 
-            if _is_denied(_relative(child)):
+            if _is_denied(relative):
                 continue
 
-            # A listed symlink is marked, but directory symlinks are never
-            # traversed. Reads still pass through _resolve().
             suffix = "@" if child.is_symlink() else ""
-            results.append(f"{_display(child)}{suffix}")
+            results.append(f"{relative.as_posix()}{suffix}")
 
             if len(results) >= limit:
                 break
@@ -186,26 +176,22 @@ def list_files(
     if not results:
         return "(no visible entries)"
 
-    if len(results) == limit:
+    if len(results) >= limit:
         results.append(f"... result limit reached ({limit})")
 
     return "\n".join(results)
 
 
-@mcp.tool(
-    title="Read source file",
-    description=(
-        f"Read a project-relative text file with line numbers. "
-        f"At most {MAX_READ_LINES} lines are returned per call."
-    ),
-    annotations=READ_ONLY,
-)
+@mcp.tool(annotations=READ_ONLY)
 def read_file(
     path: str,
     start_line: int = 1,
     end_line: int = 200,
 ) -> str:
-    """Read a bounded inclusive line range from a text file."""
+    """Read a project-relative text file with line numbers.
+
+    At most 400 lines are returned per call.
+    """
     target = _resolve(path)
 
     if not target.is_file():
@@ -215,26 +201,20 @@ def read_file(
         raise ValueError("start_line must be at least 1")
 
     if end_line < start_line:
-        raise ValueError(
-            "end_line must be greater than or equal to start_line"
-        )
+        raise ValueError("end_line must be >= start_line")
 
     if end_line - start_line + 1 > MAX_READ_LINES:
         raise ValueError(
             f"a read may contain at most {MAX_READ_LINES} lines"
         )
 
-    if _looks_binary(target):
+    if _binary(target):
         raise ValueError("binary files are not supported")
 
     output: list[str] = []
 
-    with target.open(
-        "r",
-        encoding="utf-8",
-        errors="replace",
-    ) as handle:
-        for line_number, line in enumerate(handle, start=1):
+    with target.open("r", encoding="utf-8", errors="replace") as file:
+        for line_number, line in enumerate(file, start=1):
             if line_number < start_line:
                 continue
 
@@ -246,26 +226,12 @@ def read_file(
             )
 
     if not output:
-        return (
-            f"(no lines in requested range; "
-            f"file: {_display(target)})"
-        )
+        return "(no lines in requested range)"
 
-    return (
-        f"# {_display(target)}\n"
-        + "\n".join(output)
-    )
+    return f"# {_display(target)}\n" + "\n".join(output)
 
 
-@mcp.tool(
-    title="Search source text",
-    description=(
-        "Search for a literal string in bounded-size text files "
-        "under a project-relative directory. "
-        "This is not a regular-expression search."
-    ),
-    annotations=READ_ONLY,
-)
+@mcp.tool(annotations=READ_ONLY)
 def search_text(
     query: str,
     path: str = ".",
@@ -273,14 +239,16 @@ def search_text(
     case_sensitive: bool = False,
     max_results: int = 20,
 ) -> str:
-    """Search project text files for a literal string."""
+    """Search for a literal string in bounded-size text files.
+
+    This is not a regular-expression search.
+    """
     if not query:
         raise ValueError("query must be non-empty")
 
     if not 1 <= max_results <= MAX_SEARCH_RESULTS:
         raise ValueError(
-            f"max_results must be between 1 "
-            f"and {MAX_SEARCH_RESULTS}"
+            f"max_results must be between 1 and {MAX_SEARCH_RESULTS}"
         )
 
     base = _resolve(path)
@@ -288,30 +256,19 @@ def search_text(
     if not base.is_dir():
         raise ValueError(f"not a directory: {_display(base)}")
 
-    needle = (
-        query
-        if case_sensitive
-        else query.casefold()
-    )
-
+    needle = query if case_sensitive else query.casefold()
     matches: list[str] = []
 
-    for current_text, directories, files in os.walk(
-        base,
-        followlinks=False,
-    ):
-        current = Path(current_text)
-
-        # Prune denied directories before os.walk descends.
-        directories[:] = [
+    for current, directories, files in base.walk(follow_symlinks=False):
+        # Prevent traversal into denied directories.
+        directories[:] = sorted(
             name
-            for name in sorted(directories)
+            for name in directories
             if not _is_denied(_relative(current / name))
-        ]
+        )
 
         for name in sorted(files):
-            target = current / name
-            relative = _relative(target)
+            relative = _relative(current / name)
 
             if _is_denied(relative):
                 continue
@@ -320,32 +277,25 @@ def search_text(
                 continue
 
             try:
-                resolved = target.resolve(strict=True)
+                # Re-resolve every candidate. This rejects file symlinks
+                # pointing outside /workspace or into denied paths.
+                target = _resolve(relative.as_posix())
 
-                # Reject file symlinks that escape the project root.
-                resolved_relative = _relative(resolved)
-
-                if _is_denied(resolved_relative):
+                if not target.is_file():
                     continue
 
-                if not resolved.is_file():
+                if target.stat().st_size > MAX_SEARCH_FILE_BYTES:
                     continue
 
-                if resolved.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                if _binary(target):
                     continue
 
-                if _looks_binary(resolved):
-                    continue
-
-                with resolved.open(
+                with target.open(
                     "r",
                     encoding="utf-8",
                     errors="replace",
-                ) as handle:
-                    for line_number, line in enumerate(
-                        handle,
-                        start=1,
-                    ):
+                ) as file:
+                    for line_number, line in enumerate(file, start=1):
                         haystack = (
                             line
                             if case_sensitive
@@ -358,11 +308,8 @@ def search_text(
                         excerpt = (
                             line.rstrip()
                             .replace("\t", "    ")
+                            [:MAX_OUTPUT_LINE_CHARS]
                         )
-
-                        excerpt = excerpt[
-                            :MAX_OUTPUT_LINE_CHARS
-                        ]
 
                         matches.append(
                             f"{relative.as_posix()}:"
@@ -375,21 +322,19 @@ def search_text(
                                 + "\n... result limit reached"
                             )
 
-            except (
-                OSError,
-                UnicodeError,
-                ValueError,
-            ):
-                # Files may disappear, be unreadable, or resolve outside
-                # the root while walking a concurrently changing tree.
+            except (OSError, UnicodeError, ValueError, PermissionError):
+                # Ignore files that disappear, are unreadable, or resolve
+                # somewhere Peek is not permitted to access.
                 continue
 
-    return (
-        "\n".join(matches)
-        if matches
-        else "(no matches)"
-    )
+    return "\n".join(matches) if matches else "(no matches)"
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=8000,
+        stateless_http=True,
+        json_response=True,
+    )
