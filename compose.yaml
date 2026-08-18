@@ -23,7 +23,7 @@ services:
       - /tmp:size=16m,mode=1777
 
     volumes:
-      - "${PEEK_WORKSPACE_PATH:?Set PEEK_WORKSPACE_PATH}:/workspace:ro,Z"
+      - "${PROJECT_PATH:?Set PROJECT_PATH}:/workspace:ro,Z"
 
     healthcheck:
       test:
