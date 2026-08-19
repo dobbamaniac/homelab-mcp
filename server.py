@@ -275,6 +275,7 @@ def read_file(
                     text=text[:MAX_LINE_CHARS],
                     text_truncated=text_truncated,
                 )
+            )
 
     return ReadFileResult(path=_display(target), lines=output_lines)
 
