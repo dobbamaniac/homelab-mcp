@@ -1,58 +1,45 @@
-name: peek-mcp
-
 services:
-  peek-server:
-    container_name: peek-server
+  homelab-server:
+    container_name: homelab-server
+    
     build: .
-    image: peek-server:local
     restart: on-failure:3
 
+    ports:
+      - "127.0.0.1:8000:8000"
+
     read_only: true
-    user: "${PEEK_UID:-10001}:${PEEK_GID:-10001}"
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 128
+    pids_limit: 64
 
     environment:
-      HOME: /tmp
-      PEEK_ROOT: /workspace
+      PROXMOX_URL: ${PROXMOX_URL:?Set PROXMOX_URL in .env}
+      PROXMOX_API_TOKEN: ${PROXMOX_API_TOKEN:?Set PROXMOX_API_TOKEN in .env}
 
     tmpfs:
-      - /tmp:size=16m,mode=1777
-
-    volumes:
-      - "${PROJECT_PATH:?Set PROJECT_PATH}:/workspace:ro,Z"
-
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()"
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+      - /tmp:size=16m,nosuid,nodev,noexec
 
     networks:
-      - peek-backend
+      - homelab-backend
+      - homelab-access
 
-  peek-tunnel:
-    container_name: peek-tunnel
+
+  homelab-tunnel:
+    container_name: homelab-tunnel
 
     build:
       context: "https://github.com/openai/tunnel-client.git#${TUNNEL_CLIENT_VERSION:-v0.0.10}"
       args:
         GIT_SHA: ${TUNNEL_CLIENT_VERSION:-v0.0.10}
 
-    image: peek-tunnel:local
+    image: homelab-tunnel:local
     restart: on-failure:3
 
     depends_on:
-      peek-server:
-        condition: service_healthy
+      - homelab-server
 
     read_only: true
     user: "65532:65532"
@@ -66,22 +53,24 @@ services:
       LOG_LEVEL: info
       LOG_FORMAT: json
       HOME: /tmp
-      CONTROL_PLANE_API_KEY: ${PEEK_CONTROL_PLANE_API_KEY:?Set PEEK_CONTROL_PLANE_API_KEY in .env}
+      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:?Set CONTROL_PLANE_API_KEY in .env}
 
     command:
       - --control-plane.api-key=env:CONTROL_PLANE_API_KEY
-      - --control-plane.tunnel-id=${PEEK_TUNNEL_ID:?Set PEEK_TUNNEL_ID in .env}
-      - --mcp.server-url=http://peek-server:8000/mcp
+      - --control-plane.tunnel-id=${TUNNEL_ID:?Set TUNNEL_ID in .env}
+      - --mcp.server-url=http://homelab-server:8000/mcp
 
     tmpfs:
       - /tmp:size=16m,mode=1777
 
     networks:
-      - peek-backend
-      - peek-egress
+      - homelab-backend
+      - homelab-egress
 
 networks:
-  peek-backend:
+  homelab-backend:
     internal: true
 
-  peek-egress: {}
+  homelab-access: {}
+
+  homelab-egress: {}

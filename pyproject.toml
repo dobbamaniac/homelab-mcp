@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "homelab-mcp"
+version = "0.1.0"
+requires-python = ">=3.13"
+
+dependencies = [
+    "httpx>=0.28,<1",
+    "mcp==2.0.0",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["src"]

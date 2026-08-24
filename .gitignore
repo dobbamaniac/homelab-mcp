@@ -1,4 +1,5 @@
 .env
+.venv
 secrets/*
 !secrets/.gitkeep
 __pycache__/
