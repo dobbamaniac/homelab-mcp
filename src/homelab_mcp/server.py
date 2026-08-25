@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
-from homelab_mcp.proxmox import (
-    get_proxmox_backup_status,
-    get_proxmox_guest_config,
-    get_proxmox_node_network,
-    get_proxmox_node_status,
-    get_proxmox_storage_health,
-    list_proxmox_guests,
-    list_proxmox_nodes,
-    list_proxmox_storage,
+from homelab_mcp import proxmox
+
+
+MODULES = (
+    proxmox,
 )
+
 
 # These are hints to MCP clients, not security controls
 READ_ONLY = ToolAnnotations(
@@ -20,59 +20,30 @@ READ_ONLY = ToolAnnotations(
     openWorldHint=False,        # Tool operates on a bounded/controlled set of resources
 )
 
+
+@asynccontextmanager
+async def lifespan(_: MCPServer) -> AsyncIterator[None]:
+    async with AsyncExitStack() as stack:
+        for module in MODULES:
+            await stack.enter_async_context(module.session())
+
+        yield
+
+
 def create_server() -> MCPServer:
     mcp = MCPServer(
         "Homelab",
         instructions="Read-only tools for inspecting homelab infrastructure.",
+        lifespan=lifespan,
     )
 
-    mcp.add_tool(
-        list_proxmox_guests,
-        annotations=READ_ONLY,
-        structured_output=True,
-    )
-
-    mcp.add_tool(
-        list_proxmox_nodes,
-        annotations=READ_ONLY,
-        structured_output=True,
-    )
-
-    mcp.add_tool(
-        get_proxmox_guest_config,
-        annotations=READ_ONLY,
-        structured_output=True,
-    )
-
-    mcp.add_tool(
-        list_proxmox_storage,
-        annotations=READ_ONLY,
-        structured_output=True,
-    )
-
-    mcp.add_tool(
-        get_proxmox_node_network,
-        annotations=READ_ONLY,
-        structured_output=True,
-    )
-
-    mcp.add_tool(
-        get_proxmox_node_status,
-        annotations=READ_ONLY,
-        structured_output=True,
-    )
-
-    mcp.add_tool(
-        get_proxmox_storage_health,
-        annotations=READ_ONLY,
-        structured_output=True,
-    )
-
-    mcp.add_tool(
-        get_proxmox_backup_status,
-        annotations=READ_ONLY,
-        structured_output=True,
-    )
+    for module in MODULES:
+        for tool in module.TOOLS:
+            mcp.add_tool(
+                tool,
+                annotations=READ_ONLY,
+                structured_output=True,
+            )
 
     return mcp
 
