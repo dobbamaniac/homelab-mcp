@@ -138,6 +138,7 @@ class ProxmoxGuestRuntime:
 @dataclass(frozen=True)
 class ProxmoxNodeSoftware:
     node: str
+    running_kernel: str
     repositories: dict[str, Any]
     versions: list[dict[str, Any]]
     subscription: dict[str, Any]
@@ -237,12 +238,12 @@ async def _get(
         payload = response.json()
 
     except ValueError as exc:
-        raise RuntimeError(
+        raise ProxmoxRequestError(
             f"Proxmox API returned invalid JSON for GET {path}"
         ) from exc
 
     if not isinstance(payload, dict) or "data" not in payload:
-        raise RuntimeError(f"Proxmox API returned an unexpected response for GET {path}")
+        raise ProxmoxRequestError(f"Proxmox API returned an unexpected response for GET {path}")
 
     return payload["data"]
 
@@ -268,17 +269,13 @@ async def _try_get(
 
 
 async def _list_online_nodes() -> list[str]:
-    node_data = await _get("nodes")
+    data = await _get("nodes")
 
-    nodes = [
+    return sorted(
         str(item["node"])
-        for item in node_data
+        for item in data
         if str(item.get("status", "")) == "online"
-    ]
-
-    nodes.sort()
-
-    return nodes
+    )
 
 
 async def _find_guest(vmid: int) -> ProxmoxGuest:
@@ -325,6 +322,21 @@ def _remove_key(value: Any, key: str) -> None:
     elif isinstance(value, list):
         for child in value:
             _remove_key(child, key)
+
+
+def _pick(
+    item: dict[str, Any],
+    *keys: str,
+) -> dict[str, Any]:
+    return {key: item[key] for key in keys if key in item}
+
+
+def _drop(
+    item: dict[str, Any],
+    *keys: str,
+) -> None:
+    for key in keys:
+        item.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -397,15 +409,14 @@ async def list_proxmox_guests() -> ProxmoxGuests:
 
 async def get_proxmox_guest_config(vmid: int) -> ProxmoxGuestConfig:
     """
-    Get the full Proxmox VE configuration for one VM or LXC container.
+    Get the relevant Proxmox VE configuration for one VM or LXC container.
 
-    The guest's node and type are resolved automatically from cluster resources before its 
-    read-only configuration endpoint is queried.
+    Generated identifiers, credentials, SSH keys, and other low-value fields are omitted.
     """
     guest = await _find_guest(vmid)
     config = await _get(f"nodes/{guest.node}/{guest.kind}/{guest.vmid}/config")
 
-    _remove_key(config, "digest")
+    _drop(config, "cipassword", "digest", "meta", "smbios1", "sshkeys", "vmgenid")
 
     return ProxmoxGuestConfig(
         vmid=guest.vmid,
@@ -424,8 +435,6 @@ async def list_proxmox_storage() -> ProxmoxStorages:
     node.
     """
     config_data = await _get("storage")
-    node_data = await _get("nodes")
-
     _remove_key(config_data, "digest")
 
     status_by_storage: dict[
@@ -433,20 +442,14 @@ async def list_proxmox_storage() -> ProxmoxStorages:
         dict[str, dict[str, Any]],
     ] = {}
 
-    for node_item in node_data:
-        if str(node_item.get("status", "")) != "online":
-            continue
-
-        node = str(node_item["node"])
+    for node in await _list_online_nodes():
         status_data = await _get(f"nodes/{node}/storage")
 
         for status in status_data:
             storage_id = str(status.get("storage", ""))
 
-            if not storage_id:
-                continue
-
-            status_by_storage.setdefault(storage_id, {})[node] = status
+            if storage_id:
+                status_by_storage.setdefault(storage_id, {})[node] = status
 
     storages = [
         ProxmoxStorage(
@@ -456,6 +459,12 @@ async def list_proxmox_storage() -> ProxmoxStorages:
             status_by_node=status_by_storage.get(str(item["storage"]), {}),
         ) for item in config_data
     ]
+
+    for storage in storages:
+        _drop(storage.config, "storage", "type")
+
+        for status in storage.status_by_node.values():
+            _drop(status, "storage", "type")
 
     storages.sort(key=lambda storage: storage.storage_id)
 
@@ -491,6 +500,10 @@ async def get_proxmox_node_status(node: str) -> ProxmoxNodeStatus:
     status = await _get(f"nodes/{node}/status")
     version = await _get(f"nodes/{node}/version")
 
+    status.get("cpuinfo", {}).pop("flags", None)
+    _drop(status, "kversion", "pveversion")
+    version.pop("release", None)
+
     return ProxmoxNodeStatus(
         node=node,
         status=status,
@@ -521,6 +534,7 @@ async def get_proxmox_storage_health(node: str) -> ProxmoxStorageHealth:
             continue
 
         zpool_details[name] = await _get(f"nodes/{node}/disks/zfs/{name}")
+        zpool_details[name].pop("name", None)
 
     disks.sort(key=lambda disk: str(disk.get("devpath", disk.get("name", ""))))
     zpools.sort(key=lambda pool: str(pool.get("name", "")))
@@ -542,28 +556,13 @@ async def get_proxmox_backup_status() -> ProxmoxBackupStatus:
     """
     jobs = await _get("cluster/backup")
     not_backed_up = await _get("cluster/backup-info/not-backed-up")
-    node_data = await _get("nodes")
 
     _remove_key(jobs, "digest")
     _remove_key(not_backed_up, "digest")
 
-    recent_tasks_by_node: dict[
-        str,
-        list[dict[str, Any]],
-    ] = {}
-
-    for node_item in node_data:
-        if str(node_item.get("status", "")) != "online":
-            continue
-
-        node = str(node_item["node"])
-
-        tasks = await _get(
-            f"nodes/{node}/tasks",
-            params={"typefilter": "vzdump", "limit": "10"},
-        )
-
-        recent_tasks_by_node[node] = tasks
+    recent_tasks_by_node = (
+        await list_proxmox_tasks(typefilter="vzdump", limit=10)
+    ).tasks_by_node
 
     jobs.sort(key=lambda job: str(job.get("id", "")))
     not_backed_up.sort(key=lambda guest: int(guest.get("vmid", 0)))
@@ -579,18 +578,14 @@ async def get_proxmox_firewall() -> ProxmoxFirewall:
     """
     Get Proxmox VE firewall configuration across datacenter, node, and VM/LXC scopes.
 
-    Includes firewall options and rules, cluster security groups, aliases, IP sets and their 
-    contents, and guest-local aliases, IP sets, and usable firewall references.
+    Includes firewall enable state, options and rules, cluster security groups, aliases, IP sets,
+    guest network devices, and guest-local firewall objects.
     """
-    # -----------------------------------------------------------------------
     # Datacenter firewall
-    # -----------------------------------------------------------------------
-
     datacenter_options = await _get("cluster/firewall/options")
     datacenter_rules = await _get("cluster/firewall/rules")
     datacenter_aliases = await _get("cluster/firewall/aliases")
     datacenter_ipsets = await _get_firewall_ipsets("cluster/firewall")
-    datacenter_refs = await _get("cluster/firewall/refs")
     security_groups = await _get("cluster/firewall/groups")
 
     security_group_rules: dict[
@@ -611,41 +606,33 @@ async def get_proxmox_firewall() -> ProxmoxFirewall:
     security_groups.sort(key=lambda group: str(group.get("group", "")))
 
     datacenter = {
+        "enabled": bool(datacenter_options.pop("enable", 0)),
         "options": datacenter_options,
         "rules": datacenter_rules,
         "aliases": datacenter_aliases,
         "ipsets": datacenter_ipsets,
         "security_groups": security_groups,
         "security_group_rules": security_group_rules,
-        "refs": datacenter_refs,
     }
 
     # Node firewalls
-
-    node_data = await _get("nodes")
-
     nodes: dict[
         str,
         dict[str, Any],
     ] = {}
 
-    for node_item in node_data:
-        if str(node_item.get("status", "")) != "online":
-            continue
-
-        node = str(node_item["node"])
-
+    for node in await _list_online_nodes():
         options = await _get(f"nodes/{node}/firewall/options")
         rules = await _get(f"nodes/{node}/firewall/rules")
         rules.sort(key=lambda rule: int(rule.get("pos", 0)))
 
         nodes[node] = {
+            "enabled": bool(options.pop("enable", 0)),
             "options": options,
             "rules": rules,
         }
 
     # Guest firewalls
-
     guest_inventory = await list_proxmox_guests()
 
     guests: list[dict[str, Any]] = []
@@ -665,25 +652,28 @@ async def get_proxmox_firewall() -> ProxmoxFirewall:
         rules = await _get(f"{base_path}/rules")
         aliases = await _get(f"{base_path}/aliases")
         ipsets = await _get_firewall_ipsets(base_path)
-        refs = await _get(f"{base_path}/refs")
 
         rules.sort(key=lambda rule: int(rule.get("pos", 0)))
         aliases.sort(key=lambda alias: str(alias.get("name", "")))
 
-        guests.append(
-            {
-                "vmid": guest.vmid,
-                "name": guest.name,
-                "kind": guest.kind,
-                "node": guest.node,
-                "network_devices": network_devices,
-                "options": options,
-                "rules": rules,
-                "aliases": aliases,
-                "ipsets": ipsets,
-                "refs": refs,
-            }
-        )
+        guest_firewall = {
+            "vmid": guest.vmid,
+            "name": guest.name,
+            "kind": guest.kind,
+            "node": guest.node,
+            "enabled": bool(options.pop("enable", 0)),
+            "network_devices": network_devices,
+            "options": options,
+            "rules": rules,
+        }
+
+        if aliases:
+            guest_firewall["aliases"] = aliases
+
+        if ipsets["ipsets"]:
+            guest_firewall["ipsets"] = ipsets
+
+        guests.append(guest_firewall)
 
     guests.sort(key=lambda guest: int(guest["vmid"]))
 
@@ -740,6 +730,9 @@ async def list_proxmox_tasks(
 
         tasks.sort(key=lambda task: int(task.get("starttime", 0)), reverse=True)
 
+        for task in tasks:
+            task.pop("node", None)
+
         tasks_by_node[current_node] = tasks
 
     return ProxmoxTasks(tasks_by_node=tasks_by_node)
@@ -749,6 +742,7 @@ async def get_proxmox_task(
     node: str,
     upid: str,
     log_limit: int = 200,
+    log_start: int = 0,
 ) -> ProxmoxTask:
     """
     Get status and log output for one Proxmox VE task.
@@ -756,11 +750,15 @@ async def get_proxmox_task(
     if log_limit < 1 or log_limit > 1000:
         raise ValueError("log_limit must be between 1 and 1000")
 
+    if log_start < 0:
+        raise ValueError("log_start must be non-negative")
+
     status = await _get(f"nodes/{node}/tasks/{upid}/status")
+    _drop(status, "node", "upid")
 
     log = await _get(
         f"nodes/{node}/tasks/{upid}/log",
-        params={"start": "0", "limit": str(log_limit)},
+        params={"start": str(log_start), "limit": str(log_limit)},
     )
 
     return ProxmoxTask(
@@ -787,9 +785,7 @@ async def get_proxmox_guest_runtime(vmid: int) -> ProxmoxGuestRuntime:
     pending = await _get(f"{base_path}/pending")
     snapshots = await _get(f"{base_path}/snapshot")
 
-    current.pop("blockstat", None)
-    current.pop("proxmox-support", None)
-    current.pop("nics", None)
+    _drop(current, "blockstat", "proxmox-support", "nics", "vmid", "name")
 
     pending = [
         item
@@ -803,23 +799,31 @@ async def get_proxmox_guest_runtime(vmid: int) -> ProxmoxGuestRuntime:
 
     if guest.kind == "qemu":
         agent_base = f"{base_path}/agent"
+
         info = await _try_get(f"{agent_base}/info")
         network_interfaces = await _try_get(f"{agent_base}/network-get-interfaces")
         filesystems = await _try_get(f"{agent_base}/get-fsinfo")
         os_info = await _try_get(f"{agent_base}/get-osinfo")
 
         if info["ok"]:
-            result = info["data"].get("result", {})
-            result.pop("supported_commands", None)
+            info["data"].get("result", {}).pop("supported_commands", None)
 
         if network_interfaces["ok"]:
-            for interface in network_interfaces["data"].get("result", []):
-                interface.pop("statistics", None)
+            network_interfaces["data"]["result"] = [
+                {key: value for key, value in interface.items() if key != "statistics"}
+                for interface in network_interfaces["data"].get("result", [])
+                if not str(interface.get("name", "")).startswith("veth")
+            ]
 
         if filesystems["ok"]:
-            for filesystem in filesystems["data"].get("result", []):
-                filesystem.pop("disk", None)
-                filesystem.pop("total-bytes-privileged", None)
+            filesystems["data"]["result"] = [
+                {
+                    key: value
+                    for key, value in filesystem.items()
+                    if key not in ("disk", "total-bytes-privileged")
+                }
+                for filesystem in filesystems["data"].get("result", [])
+            ]
 
         agent = {
             "info": info,
@@ -842,8 +846,8 @@ async def get_proxmox_guest_runtime(vmid: int) -> ProxmoxGuestRuntime:
 
 async def get_proxmox_node_software(node: str) -> ProxmoxNodeSoftware:
     """
-    Get repository, important package, subscription, and certificate information for one Proxmox 
-    VE node.
+    Get repository, package, subscription, certificate, and running kernel information for one
+    Proxmox VE node.
 
     Deliberately excludes /apt/update because that endpoint requires Sys.Modify and may refresh the
     APT package cache.
@@ -852,27 +856,44 @@ async def get_proxmox_node_software(node: str) -> ProxmoxNodeSoftware:
     versions = await _get(f"nodes/{node}/apt/versions")
     subscription = await _get(f"nodes/{node}/subscription")
     certificates = await _get(f"nodes/{node}/certificates/info")
+    running_kernel = next(
+        (str(package["RunningKernel"]) for package in versions if package.get("RunningKernel")),
+        "",
+    )
 
     _remove_key(repositories, "digest")
+    repositories.pop("infos", None)
+    repositories["files"] = [
+        file
+        for file in repositories.get("files", [])
+        if file.get("repositories")
+    ]
 
-    for repository in repositories.get("standard-repos", []):
-        repository.pop("description", None)
+    repositories["standard-repos"] = [
+        repo
+        for repo in repositories.get("standard-repos", [])
+        if "status" in repo
+    ]
 
-    for package in versions:
-        package.pop("Description", None)
-        package.pop("Title", None)
+    versions = [
+        _pick(
+            package,
+            "Package", "OldVersion", "Version", "Origin", "Arch", "ManagerVersion",
+        )
+        for package in versions
+    ]
 
-    subscription.pop("serverid", None)
-    subscription.pop("url", None)
+    _drop(subscription, "serverid", "url")
 
     for certificate in certificates:
         certificate.pop("pem", None)
 
-    versions.sort(key=lambda package: str(package.get("Package", package.get("package", ""))))
+    versions.sort(key=lambda package: str(package.get("Package", "")))
     certificates.sort(key=lambda certificate: str(certificate.get("filename", "")))
 
     return ProxmoxNodeSoftware(
         node=node,
+        running_kernel=running_kernel,
         repositories=repositories,
         versions=versions,
         subscription=subscription,
@@ -880,13 +901,15 @@ async def get_proxmox_node_software(node: str) -> ProxmoxNodeSoftware:
     )
 
 
-async def get_proxmox_hardware(node: str) -> ProxmoxHardware:
+async def get_proxmox_hardware(
+    node: str,
+    all_devices: bool = False,
+) -> ProxmoxHardware:
     """
-    Get PCI/USB inventory and cluster PCI/USB/directory mappings visible through the Proxmox VE 
-    API.
+    Get PCI/USB inventory and cluster PCI/USB/directory mappings for one Proxmox VE node.
 
-    USB inventory and cluster mappings are best-effort because availability depends on API 
-    permissions.
+    Known repetitive CPU-internal devices are omitted by default. Set all_devices to include the
+    complete PCI inventory. USB inventory and cluster mappings are best-effort.
     """
     pci_devices = await _get(f"nodes/{node}/hardware/pci")
     usb_result = await _try_get(f"nodes/{node}/hardware/usb")
@@ -894,13 +917,33 @@ async def get_proxmox_hardware(node: str) -> ProxmoxHardware:
     usb_devices = usb_result.get("data", []) if usb_result["ok"] else []
     usb_error = None if usb_result["ok"] else str(usb_result["error"])
 
-    mappings = {
-        "pci": await _try_get("cluster/mapping/pci"),
-        "usb": await _try_get("cluster/mapping/usb"),
-        "dir": await _try_get("cluster/mapping/dir"),
-    }
+    mappings: dict[str, Any] = {}
+
+    for kind in ("pci", "usb", "dir"):
+        result = await _try_get(f"cluster/mapping/{kind}")
+        mappings[kind] = result["data"] if result["ok"] else {"error": result["error"]}
 
     _remove_key(mappings, "digest")
+
+    if not all_devices:
+        noisy_devices = (
+            "Registers",
+            "Integrated Memory Controller",
+            "LM Channel",
+            "LMS Channel",
+            "LMDP Channel",
+            "DECS Channel",
+        )
+
+        pci_devices = [
+            device
+            for device in pci_devices
+            if not (
+                device.get("vendor") == "0x8086"
+                and str(device.get("device_name", "")).startswith("Sky Lake-E")
+                and any(name in str(device.get("device_name", "")) for name in noisy_devices)
+            )
+        ]
 
     pci_devices.sort(key=lambda device: str(device.get("id", device.get("pciid", ""))))
     usb_devices.sort(key=lambda device: (
@@ -919,17 +962,37 @@ async def get_proxmox_hardware(node: str) -> ProxmoxHardware:
 
 async def get_proxmox_access_control() -> ProxmoxAccessControl:
     """
-    Get read-only Proxmox VE access-control configuration and effective permissions for the 
-    authenticated user/API token.
+    Get effective permissions and relevant Proxmox VE access-control configuration.
 
-    Does not retrieve API token secrets or TFA configuration.
-    """
+    Repeated permissions, unused built-in roles, and low-value user metadata are omitted.
+    """    
     effective_permissions = await _get("access/permissions")
     acls = await _get("access/acl")
     roles = await _get("access/roles")
     groups = await _get("access/groups")
     realms = await _get("access/domains")
     users = await _get("access/users")
+
+    effective_permissions = {
+        path: sorted(privilege for privilege, enabled in permissions.items() if enabled)
+        for path, permissions in effective_permissions.items()
+    }
+
+    if len({tuple(privileges) for privileges in effective_permissions.values()}) == 1:
+        effective_permissions = {"all_paths": next(iter(effective_permissions.values()), [])}
+
+    acls = [_pick(acl, "path", "roleid", "ugid", "type", "propagate") for acl in acls]
+    groups = [_pick(group, "groupid", "users") for group in groups]
+    realms = [_pick(realm, "realm", "type") for realm in realms]
+    users = [_pick(user, "userid", "enable") for user in users]
+
+    used_roles = {str(acl.get("roleid", "")) for acl in acls}
+
+    roles = [
+        _pick(role, "roleid", "privs", "special")
+        for role in roles
+        if not role.get("special") or str(role.get("roleid", "")) in used_roles
+    ]
 
     acls.sort(key=lambda acl: (
         str(acl.get("path", "")), 
