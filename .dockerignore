@@ -4,3 +4,5 @@
 !.env.example
 .venv
 secrets/
+__pycache__/
+*.py[cod]
