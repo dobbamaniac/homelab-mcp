@@ -6,7 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN groupadd --gid 10001 mcp \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 mcp \
     && useradd \
         --uid 10001 \
         --gid 10001 \
@@ -17,7 +20,8 @@ RUN groupadd --gid 10001 mcp \
 COPY pyproject.toml .
 COPY src/ ./src/
 
-RUN pip install --no-cache-dir .
+RUN python -m compileall -q src \
+    && pip install --no-cache-dir .
 
 USER mcp:mcp
 
