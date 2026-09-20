@@ -15,13 +15,25 @@ services:
     environment:
       PROXMOX_URL: ${PROXMOX_URL:?Set PROXMOX_URL in .env}
       PROXMOX_API_TOKEN: ${PROXMOX_API_TOKEN:?Set PROXMOX_API_TOKEN in .env}
+      PFSENSE_URL: ${PFSENSE_URL:?Set PFSENSE_URL in .env}
+      PFSENSE_API_KEY: ${PFSENSE_API_KEY:? Set PFSENSE_API_KEY in .env}
+      LINUX_HOSTS: ${LINUX_HOSTS:?Set LINUX_HOSTS in .env}
+      LINUX_SSH_USER: ${LINUX_SSH_USER:-homelab-mcp}
+      LINUX_SSH_KEY: /run/secrets/linux_ssh_key
+      LINUX_KNOWN_HOSTS: /run/secrets/linux_known_hosts
+      DOCKER_HOSTS: ${DOCKER_HOSTS:?Set DOCKER_HOSTS in .env}
+
+    volumes:
+      - ./secrets/linux_ssh_key:/run/secrets/linux_ssh_key:ro
+      - ./secrets/linux_known_hosts:/run/secrets/linux_known_hosts:ro
 
     tmpfs:
       - /tmp:size=16m,nosuid,nodev,noexec
 
     networks:
       - homelab-backend
-      - homelab-access
+      - mcp
+      - docker-proxy
 
 
   homelab-tunnel:
@@ -68,6 +80,11 @@ networks:
   homelab-backend:
     internal: true
 
-  homelab-access: {}
+  mcp:
+    external: true
+
+  docker-proxy:
+    external: true
 
   homelab-egress: {}
+
