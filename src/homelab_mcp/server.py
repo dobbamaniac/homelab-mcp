@@ -4,13 +4,26 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
 from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
-from homelab_mcp import proxmox
+from homelab_mcp import docker, linux, pfsense, proxmox
 
 
 MODULES = (
     proxmox,
+    pfsense,
+    docker,
+    linux,
+)
+
+
+TRANSPORT_SECURITY = TransportSecuritySettings(
+    allowed_hosts=[
+        "homelab-server",
+        "homelab-server:*",
+    ],
+    allowed_origins=[],
 )
 
 
@@ -56,4 +69,5 @@ def main() -> None:
         port=8000,
         stateless_http=True,
         json_response=True,
+        transport_security=TRANSPORT_SECURITY,
     )

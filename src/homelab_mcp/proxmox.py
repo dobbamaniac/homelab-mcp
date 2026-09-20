@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
+
+from homelab_mcp.http import RequestError, get_json
+from homelab_mcp.utils import pick, pick_all, require_env
 
 
 # ---------------------------------------------------------------------------
@@ -168,31 +170,8 @@ class ProxmoxAccessControl:
 # Internal API helpers
 # ---------------------------------------------------------------------------
 
-class ProxmoxRequestError(RuntimeError):
-    pass
-
 
 _client: httpx.AsyncClient | None = None
-
-
-def _create_client() -> httpx.AsyncClient:
-    base_url = os.environ.get("PROXMOX_URL")
-    api_token = os.environ.get("PROXMOX_API_TOKEN")
-
-    if not base_url:
-        raise RuntimeError("PROXMOX_URL is not configured")
-
-    if not base_url.startswith("https://"):
-        raise RuntimeError("PROXMOX_URL must use HTTPS")
-
-    if not api_token:
-        raise RuntimeError("PROXMOX_API_TOKEN is not configured")
-
-    return httpx.AsyncClient(
-        base_url=f"{base_url.rstrip('/')}/api2/json/",
-        headers={"Authorization": f"PVEAPIToken={api_token}"},
-        timeout=10.0,
-    )
 
 
 @asynccontextmanager
@@ -203,13 +182,21 @@ async def session() -> AsyncIterator[None]:
     if _client is not None:
         raise RuntimeError("Proxmox API client is already initialized")
 
-    async with _create_client() as client:
-        _client = client
+    base_url = require_env("PROXMOX_URL")
 
-        try:
+    if not base_url.startswith("https://"):
+        raise RuntimeError("PROXMOX_URL must use HTTPS")
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=f"{base_url.rstrip('/')}/api2/json",
+            headers={"Authorization": f"PVEAPIToken={require_env('PROXMOX_API_TOKEN')}"},
+            timeout=10.0,
+        ) as _client:
             yield
-        finally:
-            _client = None
+
+    finally:
+        _client = None
 
 
 async def _get(
@@ -220,32 +207,13 @@ async def _get(
     if _client is None:
         raise RuntimeError("Proxmox API client is not initialized")
 
-    try:
-        response = await _client.get(path, params=params)
-        response.raise_for_status()
-
-    except httpx.HTTPStatusError as exc:
-        raise ProxmoxRequestError(
-            f"Proxmox API returned HTTP {exc.response.status_code} for GET {path}"
-        ) from exc
-
-    except httpx.RequestError as exc:
-        raise ProxmoxRequestError(
-            f"Unable to reach Proxmox API for GET {path}: {exc}"
-        ) from exc
-
-    try:
-        payload = response.json()
-
-    except ValueError as exc:
-        raise ProxmoxRequestError(
-            f"Proxmox API returned invalid JSON for GET {path}"
-        ) from exc
-
-    if not isinstance(payload, dict) or "data" not in payload:
-        raise ProxmoxRequestError(f"Proxmox API returned an unexpected response for GET {path}")
-
-    return payload["data"]
+    return await get_json(
+        _client,
+        path,
+        params=params,
+        source="Proxmox API",
+        key="data",
+    )
 
 
 async def _try_get(
@@ -256,7 +224,7 @@ async def _try_get(
     try:
         data = await _get(path, params=params)
 
-    except ProxmoxRequestError as exc:
+    except RequestError as exc:
         return {
             "ok": False,
             "error": str(exc),
@@ -312,6 +280,19 @@ async def _get_firewall_ipsets(base_path: str) -> dict[str, Any]:
     }
 
 
+async def _get_firewall_scope(base_path: str) -> dict[str, Any]:
+    options = await _get(f"{base_path}/options")
+    rules = await _get(f"{base_path}/rules")
+
+    rules.sort(key=lambda rule: int(rule.get("pos", 0)))
+
+    return {
+        "enabled": bool(options.pop("enable", 0)),
+        "options": options,
+        "rules": rules,
+    }
+
+
 def _remove_key(value: Any, key: str) -> None:
     if isinstance(value, dict):
         value.pop(key, None)
@@ -322,13 +303,6 @@ def _remove_key(value: Any, key: str) -> None:
     elif isinstance(value, list):
         for child in value:
             _remove_key(child, key)
-
-
-def _pick(
-    item: dict[str, Any],
-    *keys: str,
-) -> dict[str, Any]:
-    return {key: item[key] for key in keys if key in item}
 
 
 def _drop(
@@ -500,9 +474,32 @@ async def get_proxmox_node_status(node: str) -> ProxmoxNodeStatus:
     status = await _get(f"nodes/{node}/status")
     version = await _get(f"nodes/{node}/version")
 
-    status.get("cpuinfo", {}).pop("flags", None)
-    _drop(status, "kversion", "pveversion")
-    version.pop("release", None)
+    status = pick(
+        status,
+        "cpu",
+        "uptime",
+        "loadavg",
+        "memory",
+        "swap",
+        "rootfs",
+        "ksm",
+        "boot-info",
+        "current-kernel",
+        "cpuinfo",
+    )
+
+    status["cpuinfo"] = pick(
+        status.get("cpuinfo") or {},
+        "model",
+        "vendor",
+        "sockets",
+        "cores",
+        "cpus",
+        "mhz",
+        "hvm",
+    )
+
+    version = pick(version, "version", "repoid")
 
     return ProxmoxNodeStatus(
         node=node,
@@ -522,8 +519,31 @@ async def get_proxmox_storage_health(node: str) -> ProxmoxStorageHealth:
         f"nodes/{node}/disks/list",
         params={"include-partitions": "0"},
     )
-
     zpools = await _get(f"nodes/{node}/disks/zfs")
+
+    disks = pick_all(
+        disks,
+        "devpath",
+        "by_id_link",
+        "type",
+        "model",
+        "serial",
+        "size",
+        "health",
+        "wearout",
+        "used",
+        "rpm",
+    )
+
+    zpools = pick_all(
+        zpools,
+        "name",
+        "health",
+        "size",
+        "alloc",
+        "free",
+        "frag",
+    )
 
     zpool_details: dict[str, dict[str, Any]] = {}
 
@@ -581,65 +601,34 @@ async def get_proxmox_firewall() -> ProxmoxFirewall:
     Includes firewall enable state, options and rules, cluster security groups, aliases, IP sets,
     guest network devices, and guest-local firewall objects.
     """
-    # Datacenter firewall
-    datacenter_options = await _get("cluster/firewall/options")
-    datacenter_rules = await _get("cluster/firewall/rules")
-    datacenter_aliases = await _get("cluster/firewall/aliases")
-    datacenter_ipsets = await _get_firewall_ipsets("cluster/firewall")
-    security_groups = await _get("cluster/firewall/groups")
+    datacenter = await _get_firewall_scope("cluster/firewall")
+    aliases = await _get("cluster/firewall/aliases")
+    aliases.sort(key=lambda alias: str(alias.get("name", "")))
+    datacenter["aliases"] = aliases
 
-    security_group_rules: dict[
-        str,
-        list[dict[str, Any]],
-    ] = {}
+    security_groups = await _get("cluster/firewall/groups")
+    security_groups.sort(key=lambda group: str(group.get("group", "")))
+    security_group_rules = {}
 
     for group in security_groups:
         name = str(group.get("group", ""))
 
-        if not name:
-            continue
+        if name:
+            security_group_rules[name] = await _get(f"cluster/firewall/groups/{name}")
 
-        security_group_rules[name] = await _get(f"cluster/firewall/groups/{name}")
+    datacenter["security_groups"] = security_groups
+    datacenter["security_group_rules"] = security_group_rules
 
-    datacenter_rules.sort(key=lambda rule: int(rule.get("pos", 0)))
-    datacenter_aliases.sort(key=lambda alias: str(alias.get("name", "")))
-    security_groups.sort(key=lambda group: str(group.get("group", "")))
-
-    datacenter = {
-        "enabled": bool(datacenter_options.pop("enable", 0)),
-        "options": datacenter_options,
-        "rules": datacenter_rules,
-        "aliases": datacenter_aliases,
-        "ipsets": datacenter_ipsets,
-        "security_groups": security_groups,
-        "security_group_rules": security_group_rules,
-    }
-
-    # Node firewalls
-    nodes: dict[
-        str,
-        dict[str, Any],
-    ] = {}
+    nodes = {}
 
     for node in await _list_online_nodes():
-        options = await _get(f"nodes/{node}/firewall/options")
-        rules = await _get(f"nodes/{node}/firewall/rules")
-        rules.sort(key=lambda rule: int(rule.get("pos", 0)))
+        nodes[node] = await _get_firewall_scope(f"nodes/{node}/firewall")
 
-        nodes[node] = {
-            "enabled": bool(options.pop("enable", 0)),
-            "options": options,
-            "rules": rules,
-        }
-
-    # Guest firewalls
     guest_inventory = await list_proxmox_guests()
-
-    guests: list[dict[str, Any]] = []
+    guests = []
 
     for guest in guest_inventory.guests:
         base_path = f"nodes/{guest.node}/{guest.kind}/{guest.vmid}/firewall"
-
         config = await _get(f"nodes/{guest.node}/{guest.kind}/{guest.vmid}/config")
 
         network_devices = {
@@ -648,26 +637,20 @@ async def get_proxmox_firewall() -> ProxmoxFirewall:
             if key.startswith("net") and key[3:].isdigit()
         }
 
-        options = await _get(f"{base_path}/options")
-        rules = await _get(f"{base_path}/rules")
-        aliases = await _get(f"{base_path}/aliases")
-        ipsets = await _get_firewall_ipsets(base_path)
-
-        rules.sort(key=lambda rule: int(rule.get("pos", 0)))
-        aliases.sort(key=lambda alias: str(alias.get("name", "")))
-
         guest_firewall = {
             "vmid": guest.vmid,
             "name": guest.name,
             "kind": guest.kind,
             "node": guest.node,
-            "enabled": bool(options.pop("enable", 0)),
             "network_devices": network_devices,
-            "options": options,
-            "rules": rules,
+            **await _get_firewall_scope(base_path),
         }
 
+        aliases = await _get(f"{base_path}/aliases")
+        ipsets = await _get_firewall_ipsets(base_path)
+
         if aliases:
+            aliases.sort(key=lambda alias: str(alias.get("name", "")))
             guest_firewall["aliases"] = aliases
 
         if ipsets["ipsets"]:
@@ -686,7 +669,6 @@ async def get_proxmox_firewall() -> ProxmoxFirewall:
         nodes=nodes,
         guests=guests,
     )
-
 
 async def list_proxmox_tasks(
     node: str | None = None,
@@ -785,7 +767,22 @@ async def get_proxmox_guest_runtime(vmid: int) -> ProxmoxGuestRuntime:
     pending = await _get(f"{base_path}/pending")
     snapshots = await _get(f"{base_path}/snapshot")
 
-    _drop(current, "blockstat", "proxmox-support", "nics", "vmid", "name")
+    current = pick(
+        current,
+        "status",
+        "uptime",
+        "cpu",
+        "cpus",
+        "mem",
+        "maxmem",
+        "disk",
+        "maxdisk",
+        "netin",
+        "netout",
+        "pid",
+        "qmpstatus",
+        "ha",
+    )
 
     pending = [
         item
@@ -875,18 +872,39 @@ async def get_proxmox_node_software(node: str) -> ProxmoxNodeSoftware:
         if "status" in repo
     ]
 
-    versions = [
-        _pick(
-            package,
-            "Package", "OldVersion", "Version", "Origin", "Arch", "ManagerVersion",
-        )
-        for package in versions
-    ]
+    versions = pick_all(
+        versions,
+        "Package",
+        "OldVersion",
+        "Version",
+        "Origin",
+        "Arch",
+        "ManagerVersion",
+    )
 
-    _drop(subscription, "serverid", "url")
+    subscription = pick(
+        subscription,
+        "status",
+        "level",
+        "productname",
+        "regdate",
+        "nextduedate",
+        "message",
+        "sockets",
+    )
 
-    for certificate in certificates:
-        certificate.pop("pem", None)
+    certificates = pick_all(
+        certificates,
+        "filename",
+        "subject",
+        "issuer",
+        "san",
+        "fingerprint",
+        "notbefore",
+        "notafter",
+        "public-key-type",
+        "public-key-bits",
+    )
 
     versions.sort(key=lambda package: str(package.get("Package", "")))
     certificates.sort(key=lambda certificate: str(certificate.get("filename", "")))
@@ -981,15 +999,15 @@ async def get_proxmox_access_control() -> ProxmoxAccessControl:
     if len({tuple(privileges) for privileges in effective_permissions.values()}) == 1:
         effective_permissions = {"all_paths": next(iter(effective_permissions.values()), [])}
 
-    acls = [_pick(acl, "path", "roleid", "ugid", "type", "propagate") for acl in acls]
-    groups = [_pick(group, "groupid", "users") for group in groups]
-    realms = [_pick(realm, "realm", "type") for realm in realms]
-    users = [_pick(user, "userid", "enable") for user in users]
+    acls = pick_all(acls, "path", "roleid", "ugid", "type", "propagate")
+    groups = pick_all(groups, "groupid", "users")
+    realms = pick_all(realms, "realm", "type")
+    users = pick_all(users, "userid", "enable")
 
     used_roles = {str(acl.get("roleid", "")) for acl in acls}
 
     roles = [
-        _pick(role, "roleid", "privs", "special")
+        pick(role, "roleid", "privs", "special")
         for role in roles
         if not role.get("special") or str(role.get("roleid", "")) in used_roles
     ]
