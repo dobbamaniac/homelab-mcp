@@ -113,7 +113,23 @@ class LinuxNetwork:
 
 
 @dataclass(frozen=True)
-class LinuxService:
+class LinuxPackage:
+    name: str
+    version: str
+    architecture: str
+    automatic: bool
+    held: bool
+    synopsis: str
+
+
+@dataclass(frozen=True)
+class LinuxPackages:
+    host: str
+    packages: list[LinuxPackage]
+
+
+@dataclass(frozen=True)
+class LinuxUnit:
     name: str
     description: str
     load_state: str
@@ -122,13 +138,13 @@ class LinuxService:
 
 
 @dataclass(frozen=True)
-class LinuxServices:
+class LinuxUnits:
     host: str
-    services: list[LinuxService]
+    units: list[LinuxUnit]
 
 
 @dataclass(frozen=True)
-class LinuxServiceDetails:
+class LinuxUnitDetails:
     host: str
     name: str
     description: str
@@ -136,10 +152,24 @@ class LinuxServiceDetails:
     active_state: str
     sub_state: str
     unit_file_state: str | None
-    result: str | None
-    main_pid: int | None
-    exec_main_status: int | None
-    restart_count: int
+    unit_file_preset: str | None
+    fragment_path: str | None
+    source_path: str | None
+    drop_in_paths: list[str]
+    need_daemon_reload: bool
+
+
+@dataclass(frozen=True)
+class LinuxUnitFile:
+    name: str
+    state: str
+    preset: str | None
+
+
+@dataclass(frozen=True)
+class LinuxUnitFiles:
+    host: str
+    unit_files: list[LinuxUnitFile]
 
 
 @dataclass(frozen=True)
@@ -156,6 +186,19 @@ class LinuxJournalEntry:
 class LinuxJournal:
     host: str
     entries: list[LinuxJournalEntry]
+
+
+@dataclass(frozen=True)
+class LinuxSysctl:
+    key: str
+    value: str
+
+
+@dataclass(frozen=True)
+class LinuxSysctls:
+    host: str
+    prefix: str
+    values: list[LinuxSysctl]
 
 
 @dataclass(frozen=True)
@@ -176,7 +219,7 @@ class LinuxFile:
 
 
 # -------------------------------------------------------------------------------------------------
-# Internal SSH helpers
+# Internal helpers
 # -------------------------------------------------------------------------------------------------
 
 
@@ -186,39 +229,41 @@ class LinuxRequestError(RuntimeError):
 
 _hosts: dict[str, str] = {}
 _files: set[str] = set()
-_MAX_FILE_BYTES = 128*1024
+
+_SSH_TIMEOUT = 15.0
+_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 
 _HOST_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _HOST_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
-_DOCKER_BRIDGE = re.compile(r"br-[0-9a-f]{12}")
-_SERVICE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.service")
-_SSH_TIMEOUT = 15.0
-_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+
 _PSEUDO_FILESYSTEMS = {
-    "devtmpfs",
-    "tmpfs",
-    "proc",
-    "sysfs",
-    "cgroup",
-    "cgroup2",
-    "devpts",
-    "securityfs",
-    "debugfs",
-    "tracefs",
-    "configfs",
-    "pstore",
-    "mqueue",
+    "devtmpfs", "tmpfs", "proc", "sysfs", "cgroup", "cgroup2", "devpts", "securityfs", "debugfs", 
+    "tracefs", "configfs", "pstore", "mqueue",
 }
-_JOURNAL_PRIORITIES = (
-    "emerg",
-    "alert",
-    "crit",
-    "err",
-    "warning",
-    "notice",
-    "info",
-    "debug",
+
+_DOCKER_BRIDGE = re.compile(r"br-[0-9a-f]{12}")
+
+_UNIT_REF = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9_.@:-]*"
+    r"\.(?:service|socket|timer|target|device|mount|automount|"
+    r"swap|path|slice|scope)"
 )
+_JOURNAL_PRIORITIES = ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")
+_SYSTEMD_CONFIGS = {
+    "system": "systemd/system.conf",
+    "journald": "systemd/journald.conf",
+    "logind": "systemd/logind.conf",
+    "resolved": "systemd/resolved.conf",
+    "timesyncd": "systemd/timesyncd.conf",
+    "networkd": "systemd/networkd.conf",
+    "oomd": "systemd/oomd.conf",
+    "sysctl": "sysctl.d",
+}
+_SYSCTL_REF = re.compile(
+    r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*"
+)
+
+_MAX_FILE_BYTES = 128 * 1024
 
 
 def _configured_hosts() -> dict[str, str]:
@@ -328,26 +373,13 @@ async def _run(
     ))
 
     process = await asyncio.create_subprocess_exec(
-        "ssh",
-        "-F", "/dev/null",
-        "-T",
-        "-i", key,
-        "-o", "BatchMode=yes",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={known_hosts}",
-        "-o", "GlobalKnownHostsFile=/dev/null",
-        "-o", "UpdateHostKeys=no",
-        "-o", f"HostKeyAlias={host}",
-        "-o", "ClearAllForwardings=yes",
-        "-o", "ConnectTimeout=5",
-        "-o", "ConnectionAttempts=1",
-        "-o", "LogLevel=ERROR",
-        f"{user}@{target}",
-        remote_command,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        "ssh", "-F", "/dev/null", "-T", "-i", key, "-o", "BatchMode=yes", 
+        "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes", 
+        "-o", f"UserKnownHostsFile={known_hosts}", "-o", "GlobalKnownHostsFile=/dev/null", 
+        "-o", "UpdateHostKeys=no", "-o", f"HostKeyAlias={host}", "-o", "ClearAllForwardings=yes", 
+        "-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1", "-o", "LogLevel=ERROR", 
+        f"{user}@{target}", remote_command, stdin=asyncio.subprocess.DEVNULL, 
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
 
     try:
@@ -371,24 +403,19 @@ async def _run(
             message = message[:500] + "..."
 
         raise LinuxRequestError(
-            f"Linux host {host!r} returned exit status "
-            f"{process.returncode} for {command[0]!r}"
+            f"Linux host {host!r} returned exit status {process.returncode} for {command[0]!r}"
             + (f": {message}" if message else "")
         )
 
     if len(stdout) > _MAX_OUTPUT_BYTES:
-        raise LinuxRequestError(
-            f"Linux host {host!r} returned too much output "
-            f"for {command[0]!r}"
-        )
+        raise LinuxRequestError(f"Linux host {host!r} returned too much output for {command[0]!r}")
 
     try:
         return stdout.decode()
 
     except UnicodeDecodeError as exc:
         raise LinuxRequestError(
-            f"Linux host {host!r} returned invalid text "
-            f"for {command[0]!r}"
+            f"Linux host {host!r} returned invalid text for {command[0]!r}"
         ) from exc
 
 
@@ -403,21 +430,8 @@ async def _run_json(
 
     except json.JSONDecodeError as exc:
         raise LinuxRequestError(
-            f"Linux host {host!r} returned invalid JSON "
-            f"for {command[0]!r}"
+            f"Linux host {host!r} returned invalid JSON for {command[0]!r}"
         ) from exc
-
-
-def _flatten(
-    items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    flattened: list[dict[str, Any]] = []
-
-    for item in items:
-        flattened.append(item)
-        flattened.extend(_flatten(item.get("children") or []))
-
-    return flattened
 
 
 def _meminfo(value: str) -> dict[str, int]:
@@ -434,6 +448,18 @@ def _meminfo(value: str) -> dict[str, int]:
             memory[key] = int(fields[0]) * 1024
 
     return memory
+
+
+def _flatten(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    flattened: list[dict[str, Any]] = []
+
+    for item in items:
+        flattened.append(item)
+        flattened.extend(_flatten(item.get("children") or []))
+
+    return flattened
 
 
 def _dns_servers(value: str) -> list[str]:
@@ -468,9 +494,16 @@ def _virtual_interface(name: str) -> bool:
     )
 
 
-def _service_ref(value: str) -> str:
-    if not _SERVICE_REF.fullmatch(value):
-        raise RuntimeError(f"Invalid systemd service name {value!r}")
+def _unit_ref(value: str) -> str:
+    if not _UNIT_REF.fullmatch(value):
+        raise RuntimeError(f"Invalid systemd unit name {value!r}")
+
+    return value
+
+
+def _sysctl_ref(value: str) -> str:
+    if not _SYSCTL_REF.fullmatch(value):
+        raise RuntimeError(f"Invalid sysctl prefix {value!r}")
 
     return value
     
@@ -482,42 +515,21 @@ def _service_ref(value: str) -> str:
 
 async def _get_linux_host(name: str) -> LinuxHost:
     info, architecture, virtualization, uptime = await asyncio.gather(
-        _run_json(
-            name,
-            "hostnamectl",
-            "--json=short",
-            "status",
-        ),
-        _run(
-            name,
-            "uname",
-            "-m",
-        ),
-        _run(
-            name,
-            "systemd-detect-virt",
-            check=False,
-        ),
-        _run(
-            name,
-            "cat",
-            "/proc/uptime",
-        ),
+        _run_json(name, "hostnamectl", "--json=short", "status"),
+        _run( name, "uname", "-m"),
+        _run( name, "systemd-detect-virt", check=False),
+        _run( name, "cat", "/proc/uptime"),
     )
 
     if not isinstance(info, dict):
-        raise LinuxRequestError(
-            f"Linux host {name!r} returned invalid hostname information"
-        )
+        raise LinuxRequestError(f"Linux host {name!r} returned invalid hostname information")
 
     virtualization = virtualization.strip()
 
     return LinuxHost(
         name=name,
         hostname=str(info.get("Hostname", "")),
-        operating_system=str(
-            info.get("OperatingSystemPrettyName", "")
-        ),
+        operating_system=str(info.get("OperatingSystemPrettyName", "")),
         kernel_version=str(info.get("KernelRelease", "")),
         architecture=architecture.strip(),
         virtualization=(
@@ -527,6 +539,7 @@ async def _get_linux_host(name: str) -> LinuxHost:
         ),
         uptime_seconds=int(float(uptime.split()[0])),
     )
+
 
 async def list_linux_hosts() -> LinuxHosts:
     """List configured Linux hosts and compact operating-system information."""
@@ -541,26 +554,10 @@ async def list_linux_hosts() -> LinuxHosts:
 async def get_linux_status(host: str) -> LinuxStatus:
     """Get current CPU, memory, swap, load, and uptime status for a Linux host."""
     cpu, load, raw_memory, uptime = await asyncio.gather(
-        _run(
-            host,
-            "getconf",
-            "_NPROCESSORS_ONLN",
-        ),
-        _run(
-            host,
-            "cat",
-            "/proc/loadavg",
-        ),
-        _run(
-            host,
-            "cat",
-            "/proc/meminfo",
-        ),
-        _run(
-            host,
-            "cat",
-            "/proc/uptime",
-        ),
+        _run(host, "getconf", "_NPROCESSORS_ONLN"),
+        _run(host, "cat", "/proc/loadavg"),
+        _run(host, "cat", "/proc/meminfo"),
+        _run(host, "cat", "/proc/uptime"),
     )
 
     memory = _meminfo(raw_memory)
@@ -586,21 +583,12 @@ async def get_linux_storage(host: str) -> LinuxStorage:
     """Get block-device and mounted-filesystem capacity for a Linux host."""
     lsblk, findmnt = await asyncio.gather(
         _run_json(
-            host,
-            "lsblk",
-            "--json",
-            "--bytes",
-            "--output",
-            "NAME,PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS",
+            host, "lsblk", "--json", "--bytes", 
+            "--output", "NAME,PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS"
         ),
         _run_json(
-            host,
-            "findmnt",
-            "--json",
-            "--bytes",
-            "--df",
-            "--output",
-            "SOURCE,TARGET,FSTYPE,SIZE,USED,AVAIL,USE%,OPTIONS",
+            host, "findmnt", "--json", "--bytes", "--df", 
+            "--output", "SOURCE,TARGET,FSTYPE,SIZE,USED,AVAIL,USE%,OPTIONS"
         ),
     )
 
@@ -645,10 +633,7 @@ async def get_linux_storage(host: str) -> LinuxStorage:
                 used_bytes=int(item.get("used") or 0),
                 available_bytes=int(item.get("avail") or 0),
                 usage_ratio=float(usage or 0) / 100,
-                read_only=(
-                    "ro"
-                    in str(item.get("options", "")).split(",")
-                ),
+                read_only=("ro" in str(item.get("options", "")).split(",")),
             )
         )
 
@@ -665,34 +650,10 @@ async def get_linux_storage(host: str) -> LinuxStorage:
 async def get_linux_network(host: str) -> LinuxNetwork:
     """Get interfaces, routes, DNS servers, and listening sockets for a Linux host."""
     addresses, route_data, sockets, resolv_conf = await asyncio.gather(
-        _run_json(
-            host,
-            "ip",
-            "-json",
-            "address",
-            "show",
-        ),
-        _run_json(
-            host,
-            "ip",
-            "-json",
-            "route",
-            "show",
-            "table",
-            "main",
-        ),
-        _run(
-            host,
-            "ss",
-            "-H",
-            "-lntu",
-        ),
-        _run(
-            host,
-            "cat",
-            "/etc/resolv.conf",
-            check=False,
-        ),
+        _run_json(host, "ip", "-json", "address", "show"),
+        _run_json(host, "ip", "-json", "route", "show", "table", "main"),
+        _run(host, "ss", "-H", "-lntu"),
+        _run(host, "cat", "/etc/resolv.conf", check=False),
     )
 
     if not isinstance(addresses, list) or not isinstance(route_data, list):
@@ -790,29 +751,91 @@ async def get_linux_network(host: str) -> LinuxNetwork:
     )
 
 
-async def get_linux_services(
+async def list_linux_packages(
     host: str,
-    state: Literal["active", "inactive", "failed", "all"] = "active", 
-) -> LinuxServices:
+    manual_only: bool = False,
+) -> LinuxPackages:
     """
-    List loaded systemd services on a Linux host.
+    List installed Debian packages on a Linux host.
 
-    Defaults to active services. Set state to "inactive", "failed",
-    or "all" to select another view.
+    Includes automatic/manual installation state and package holds.
+    Set manual_only to omit automatically installed dependencies.
     """
-    output = await _run(
-        host,
-        "systemctl",
-        "--plain",
-        "--no-legend",
-        "--no-pager",
-        "--full",
-        "list-units",
-        "--type=service",
-        "--all",
+    package_output, automatic_output, held_output = await asyncio.gather(
+        _run(
+            host,
+            "dpkg-query",
+            "--show",
+            "--showformat=${binary:Package}\\t${Version}\\t${Architecture}\\t"
+            "${db:Status-Status}\\t${binary:Synopsis}\\n",
+        ),
+        _run(host, "apt-mark", "showauto"),
+        _run(host, "apt-mark", "showhold"),
     )
 
-    services: list[LinuxService] = []
+    automatic = set(automatic_output.splitlines())
+    held = set(held_output.splitlines())
+
+    def marked(name: str, values: set[str]) -> bool:
+        base_name = name.partition(":")[0]
+        return name in values or base_name in values
+
+    packages: list[LinuxPackage] = []
+
+    for line in package_output.splitlines():
+        fields = line.split("\t", 4)
+
+        if len(fields) != 5:
+            continue
+
+        name, version, architecture, status, synopsis = fields
+
+        if status != "installed":
+            continue
+
+        is_automatic = marked(name, automatic)
+
+        if manual_only and is_automatic:
+            continue
+
+        packages.append(
+            LinuxPackage(
+                name=name,
+                version=version,
+                architecture=architecture,
+                automatic=is_automatic,
+                held=marked(name, held),
+                synopsis=redact_text(synopsis),
+            )
+        )
+
+    packages.sort(key=lambda package: package.name)
+
+    return LinuxPackages(
+        host=host,
+        packages=packages,
+    )
+
+
+async def list_linux_units(
+    host: str,
+    type: Literal[
+        "service", "socket", "timer", "target", "device", "mount", "automount", "swap", "path", 
+        "slice", "scope"
+    ] = "service",
+    state: Literal["active", "inactive", "failed", "all"] = "active",
+) -> LinuxUnits:
+    """
+    List loaded systemd units on a Linux host.
+
+    Defaults to active services. Select another unit type or state as needed.
+    """
+    output = await _run(
+        host, "systemctl", "--plain", "--no-legend", "--no-pager", "--full", "list-units", 
+        f"--type={type}", "--all"
+    )
+
+    units: list[LinuxUnit] = []
 
     for line in output.splitlines():
         line = line.lstrip()
@@ -825,8 +848,8 @@ async def get_linux_services(
         if len(fields) < 4:
             continue
 
-        services.append(
-            LinuxService(
+        units.append(
+            LinuxUnit(
                 name=fields[0],
                 load_state=fields[1],
                 active_state=fields[2],
@@ -839,43 +862,32 @@ async def get_linux_services(
             )
         )
 
-    services = [
-        service
-        for service in services
-        if service.load_state == "loaded"
+    units = [
+        unit for unit in units
+        if unit.load_state == "loaded"
+        and (state == "all" or unit.active_state == state)
     ]
 
-    if state != "all":
-        services = [
-            service
-            for service in services
-            if service.active_state == state
-        ]
+    units.sort(key=lambda unit: unit.name)
 
-    services.sort(key=lambda service: service.name)
-
-    return LinuxServices(
+    return LinuxUnits(
         host=host,
-        services=services,
+        units=units,
     )
 
 
-async def get_linux_service(
+async def get_linux_unit(
     host: str,
-    service: str,
-) -> LinuxServiceDetails:
-    """Get detailed systemd state for one Linux service."""
-    service = _service_ref(service)
+    unit: str,
+) -> LinuxUnitDetails:
+    """Get state and configuration provenance for one systemd unit."""
+    unit = _unit_ref(unit)
 
     output = await _run(
-        host,
-        "systemctl",
-        "--no-pager",
-        "--property="
-        "Id,Description,LoadState,ActiveState,SubState,"
-        "UnitFileState,Result,MainPID,ExecMainStatus,NRestarts",
-        "show",
-        service,
+        host, "systemctl", "--no-pager", 
+        "--property=" "Id,Description,LoadState,ActiveState,SubState," 
+        "UnitFileState,UnitFilePreset,FragmentPath,SourcePath," "DropInPaths,NeedDaemonReload", 
+        "show", unit,
     )
 
     properties = dict(
@@ -884,25 +896,61 @@ async def get_linux_service(
         if "=" in line
     )
 
-    main_pid = int(properties.get("MainPID") or 0)
-    exec_main_status = properties.get("ExecMainStatus")
-
-    return LinuxServiceDetails(
+    return LinuxUnitDetails(
         host=host,
-        name=properties.get("Id", service),
+        name=properties.get("Id", unit),
         description=redact_text(properties.get("Description", "")),
         load_state=properties.get("LoadState", ""),
         active_state=properties.get("ActiveState", ""),
         sub_state=properties.get("SubState", ""),
-        unit_file_state=(properties.get("UnitFileState") or None),
-        result=properties.get("Result") or None,
-        main_pid=main_pid or None,
-        exec_main_status=(
-            int(exec_main_status)
-            if exec_main_status
-            else None
-        ),
-        restart_count=int(properties.get("NRestarts") or 0),
+        unit_file_state=properties.get("UnitFileState") or None,
+        unit_file_preset=properties.get("UnitFilePreset") or None,
+        fragment_path=properties.get("FragmentPath") or None,
+        source_path=properties.get("SourcePath") or None,
+        drop_in_paths=properties.get("DropInPaths", "").split(),
+        need_daemon_reload=(properties.get("NeedDaemonReload") == "yes"),
+    )
+
+
+async def get_linux_unit_files(
+    host: str,
+    type: Literal[
+        "service", "socket", "timer", "target", "device", "mount", "automount", "swap", "path", 
+        "slice", "scope"
+    ] = "service"
+) -> LinuxUnitFiles:
+    """List installed systemd unit files and their enablement state."""
+
+    output = await _run(
+        host, "systemctl", "--no-legend", "--no-pager", "--full", "list-unit-files", 
+        f"--type={type}"
+    )
+
+    unit_files: list[LinuxUnitFile] = []
+
+    for line in output.splitlines():
+        fields = line.split()
+
+        if len(fields) < 2:
+            continue
+
+        unit_files.append(
+            LinuxUnitFile(
+                name=fields[0],
+                state=fields[1],
+                preset=(
+                    fields[2]
+                    if len(fields) >= 3 and fields[2] != "-"
+                    else None
+                ),
+            )
+        )
+
+    unit_files.sort(key=lambda item: item.name)
+
+    return LinuxUnitFiles(
+        host=host,
+        unit_files=unit_files,
     )
 
 
@@ -910,14 +958,7 @@ async def get_linux_journal(
     host: str,
     unit: str | None = None,
     priority: Literal[
-        "emerg",
-        "alert",
-        "crit",
-        "err",
-        "warning",
-        "notice",
-        "info",
-        "debug",
+        "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"
     ] | None = None,
     since_seconds: int = 3600,
     limit: int = 200,
@@ -925,7 +966,7 @@ async def get_linux_journal(
     """
     Get recent systemd journal entries from a Linux host.
 
-    Optionally filters by service unit and priority. Results are bounded by time and entry count.
+    Optionally filters by systemd unit and priority. Results are bounded by time and entry count.
     """
     if not 1 <= since_seconds <= 604800:
         raise RuntimeError("since_seconds must be between 1 and 604800")
@@ -934,18 +975,13 @@ async def get_linux_journal(
         raise RuntimeError("limit must be between 1 and 1000")
 
     command = [
-        "journalctl",
-        "--quiet",
-        "--no-pager",
-        "--output=json",
-        "--output-fields="
-        "PRIORITY,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_PID,MESSAGE",
-        f"--since=-{since_seconds}s",
-        f"--lines={limit}",
+        "journalctl", "--quiet", "--no-pager", "--output=json", 
+        "--output-fields=" "PRIORITY,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_PID,MESSAGE", 
+        f"--since=-{since_seconds}s", f"--lines={limit}"
     ]
 
     if unit is not None:
-        command.append(f"--unit={_service_ref(unit)}")
+        command.append(f"--unit={_unit_ref(unit)}")
 
     if priority is not None:
         command.append(f"--priority={priority}")
@@ -961,7 +997,9 @@ async def get_linux_journal(
             item = json.loads(line)
 
         except json.JSONDecodeError as exc:
-            raise LinuxRequestError(f"Linux host {host!r} returned invalid journal JSON") from exc
+            raise LinuxRequestError(
+                f"Linux host {host!r} returned invalid journal JSON"
+            ) from exc
 
         if not isinstance(item, dict):
             continue
@@ -1009,6 +1047,45 @@ async def get_linux_journal(
     )
 
 
+async def get_linux_sysctls(
+    host: str,
+    prefix: str,
+) -> LinuxSysctls:
+    """
+    Get current kernel sysctl values below a prefix.
+
+    The prefix must use dotted sysctl notation, such as "net.ipv4" or "vm".
+    """
+    prefix = _sysctl_ref(prefix)
+
+    pattern = "^" + prefix.replace(".", r"\.") + r"(\.|$)"
+
+    output = await _run(host, "sysctl", "--all", "--pattern", pattern)
+
+    values: list[LinuxSysctl] = []
+
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+
+        if not separator:
+            continue
+
+        values.append(
+            LinuxSysctl(
+                key=key.strip(),
+                value=redact_text(value.strip()),
+            )
+        )
+
+    values.sort(key=lambda item: item.key)
+
+    return LinuxSysctls(
+        host=host,
+        prefix=prefix,
+        values=values,
+    )
+
+
 async def read_linux_file(
     host: str,
     path: str,
@@ -1024,12 +1101,7 @@ async def read_linux_file(
         raise RuntimeError(f"File path {path!r} is not approved")
 
     metadata = await _run(
-        host,
-        "stat",
-        "--dereference",
-        r"--printf=%F\n%s\n%a\n%u\n%g\n%U\n%G\n%Y\n",
-        "--",
-        path,
+        host, "stat", "--dereference", r"--printf=%F\n%s\n%a\n%u\n%g\n%U\n%G\n%Y\n", "--", path
     )
 
     fields = metadata.splitlines()
@@ -1039,16 +1111,7 @@ async def read_linux_file(
             f"Linux host {host!r} returned invalid stat information for {path!r}"
         )
 
-    (
-        file_type,
-        raw_size,
-        raw_mode,
-        raw_uid,
-        raw_gid,
-        owner,
-        group,
-        raw_modified,
-    ) = fields
+    file_type, raw_size, raw_mode, raw_uid, raw_gid, owner, group, raw_modified = fields
 
     try:
         size_bytes = int(raw_size)
@@ -1073,13 +1136,7 @@ async def read_linux_file(
 
     else:
         try:
-            raw_content = await _run(
-                host,
-                "head",
-                f"--bytes={_MAX_FILE_BYTES + 1}",
-                "--",
-                path,
-            )
+            raw_content = await _run(host, "head", f"--bytes={_MAX_FILE_BYTES + 1}", "--", path)
 
             if len(raw_content.encode()) > _MAX_FILE_BYTES:
                 read_error = "File exceeded the size limit while being read"
@@ -1115,8 +1172,11 @@ TOOLS = (
     get_linux_status,
     get_linux_storage,
     get_linux_network,
-    get_linux_services,
-    get_linux_service,
+    list_linux_packages,
+    list_linux_units,
+    get_linux_unit,
+    get_linux_unit_files,
     get_linux_journal,
+    get_linux_sysctls,
     read_linux_file,
 )
