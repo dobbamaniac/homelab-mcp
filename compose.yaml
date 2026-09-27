@@ -17,16 +17,17 @@ services:
       PROXMOX_API_TOKEN: ${PROXMOX_API_TOKEN:?Set PROXMOX_API_TOKEN in .env}
       PFSENSE_URL: ${PFSENSE_URL:?Set PFSENSE_URL in .env}
       PFSENSE_API_KEY: ${PFSENSE_API_KEY:? Set PFSENSE_API_KEY in .env}
-      LINUX_HOSTS: ${LINUX_HOSTS:?Set LINUX_HOSTS in .env}
-      LINUX_SSH_USER: ${LINUX_SSH_USER:-homelab-mcp}
-      LINUX_SSH_KEY: /run/secrets/linux_ssh_key
-      LINUX_KNOWN_HOSTS: /run/secrets/linux_known_hosts
+      SSH_HOSTS: ${SSH_HOSTS:?Set SSH_HOSTS in .env}
+      SSH_USER: ${SSH_USER:-homelab-mcp}
+      SSH_KEY: /run/secrets/ssh_key
+      SSH_KNOWN_HOSTS: /run/secrets/known_hosts
       LINUX_FILES: ${LINUX_FILES:?Set LINUX_FILES in .env}
       DOCKER_HOSTS: ${DOCKER_HOSTS:?Set DOCKER_HOSTS in .env}
+      ZFS_HOSTS: ${ZFS_HOSTS:?Set ZFS_HOSTS in .env}
 
     volumes:
-      - ./secrets/linux_ssh_key:/run/secrets/linux_ssh_key:ro
-      - ./secrets/linux_known_hosts:/run/secrets/linux_known_hosts:ro
+      - ./secrets/ssh_key:/run/secrets/ssh_key:ro
+      - ./secrets/known_hosts:/run/secrets/known_hosts:ro
 
     tmpfs:
       - /tmp:size=16m,nosuid,nodev,noexec

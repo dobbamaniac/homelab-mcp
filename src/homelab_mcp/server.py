@@ -7,7 +7,7 @@ from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
-from homelab_mcp import docker, linux, pfsense, proxmox
+from homelab_mcp import docker, linux, pfsense, proxmox, ssh, zfs
 
 
 MODULES = (
@@ -15,6 +15,7 @@ MODULES = (
     pfsense,
     docker,
     linux,
+    zfs,
 )
 
 
@@ -37,6 +38,8 @@ READ_ONLY = ToolAnnotations(
 @asynccontextmanager
 async def lifespan(_: MCPServer) -> AsyncIterator[None]:
     async with AsyncExitStack() as stack:
+        await stack.enter_async_context(ssh.session())
+
         for module in MODULES:
             await stack.enter_async_context(module.session())
 
