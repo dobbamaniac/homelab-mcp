@@ -9,7 +9,7 @@ from pydantic import Field
 
 from homelab_mcp.redact import redact_text
 from homelab_mcp.utils import require_env
-from homelab_mcp.ssh import run as _run
+from homelab_mcp.ssh import host_names as _ssh_hosts, run as _run
 
 
 # -------------------------------------------------------------------------------------------------
@@ -91,6 +91,11 @@ def _optional_int(value: str) -> int | None:
 @asynccontextmanager
 async def session() -> AsyncIterator[None]:
     """ZFS uses the configured Linux SSH transport."""
+    host = _host()
+
+    if host not in _ssh_hosts():
+        raise RuntimeError(f"ZFS host {host!r} is not configured for SSH")
+
     yield
 
 

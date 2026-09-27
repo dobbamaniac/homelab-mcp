@@ -323,7 +323,7 @@ def _meminfo(value: str) -> dict[str, int]:
 
 def _flatten(
     items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> Iterator[dict[str, Any]]:
     for item in items:
         yield item
         yield from _flatten(item.get("children") or [])
@@ -886,7 +886,7 @@ async def get_linux_journal(
 
 async def get_linux_sysctls(
     host: str,
-    prefix: SysctlsPrefix,
+    prefix: SysctlPrefix,
 ) -> LinuxSysctls:
     """
     Get current kernel sysctl values below a prefix.
