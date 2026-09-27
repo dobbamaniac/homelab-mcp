@@ -21,6 +21,7 @@ services:
       LINUX_SSH_USER: ${LINUX_SSH_USER:-homelab-mcp}
       LINUX_SSH_KEY: /run/secrets/linux_ssh_key
       LINUX_KNOWN_HOSTS: /run/secrets/linux_known_hosts
+      LINUX_FILES: ${LINUX_FILES:?Set LINUX_FILES in .env}
       DOCKER_HOSTS: ${DOCKER_HOSTS:?Set DOCKER_HOSTS in .env}
 
     volumes:

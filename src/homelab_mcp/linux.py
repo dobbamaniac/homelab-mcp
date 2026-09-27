@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import posixpath
 import re
 import shlex
 import shutil
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from homelab_mcp.redact import redact_text
 from homelab_mcp.utils import require_env
 
 
@@ -124,6 +126,55 @@ class LinuxServices:
     host: str
     services: list[LinuxService]
 
+
+@dataclass(frozen=True)
+class LinuxServiceDetails:
+    host: str
+    name: str
+    description: str
+    load_state: str
+    active_state: str
+    sub_state: str
+    unit_file_state: str | None
+    result: str | None
+    main_pid: int | None
+    exec_main_status: int | None
+    restart_count: int
+
+
+@dataclass(frozen=True)
+class LinuxJournalEntry:
+    timestamp_us: int
+    priority: str | None
+    unit: str | None
+    identifier: str | None
+    pid: int | None
+    message: str
+
+
+@dataclass(frozen=True)
+class LinuxJournal:
+    host: str
+    entries: list[LinuxJournalEntry]
+
+
+@dataclass(frozen=True)
+class LinuxFile:
+    host: str
+    path: str
+    file_type: str
+    size_bytes: int
+    mode: str
+    uid: int
+    gid: int
+    owner: str
+    group: str
+    modified_at_epoch: int
+    content: str | None
+    redacted: bool
+    read_error: str | None
+
+
 # -------------------------------------------------------------------------------------------------
 # Internal SSH helpers
 # -------------------------------------------------------------------------------------------------
@@ -134,9 +185,13 @@ class LinuxRequestError(RuntimeError):
 
 
 _hosts: dict[str, str] = {}
+_files: set[str] = set()
+_MAX_FILE_BYTES = 128*1024
 
 _HOST_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _HOST_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
+_DOCKER_BRIDGE = re.compile(r"br-[0-9a-f]{12}")
+_SERVICE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*\.service")
 _SSH_TIMEOUT = 15.0
 _MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _PSEUDO_FILESYSTEMS = {
@@ -154,7 +209,16 @@ _PSEUDO_FILESYSTEMS = {
     "pstore",
     "mqueue",
 }
-_DOCKER_BRIDGE = re.compile(r"br-[0-9a-f]{12}")
+_JOURNAL_PRIORITIES = (
+    "emerg",
+    "alert",
+    "crit",
+    "err",
+    "warning",
+    "notice",
+    "info",
+    "debug",
+)
 
 
 def _configured_hosts() -> dict[str, str]:
@@ -183,6 +247,28 @@ def _configured_hosts() -> dict[str, str]:
     return hosts
 
 
+def _configured_files() -> set[str]:
+    files: set[str] = set()
+
+    for value in require_env("LINUX_FILES").split(","):
+        path = value.strip()
+
+        if not path:
+            raise RuntimeError("LINUX_FILES contains an empty entry")
+
+        if not path.startswith("/") or posixpath.normpath(path) != path:
+            raise RuntimeError(
+                f"LINUX_FILES must contain normalized absolute paths, got {path!r}"
+            )
+
+        if path in files:
+            raise RuntimeError(f"Duplicate Linux configuration path {path!r}")
+
+        files.add(path)
+
+    return files
+
+
 def _host(name: str) -> str:
     target = _hosts.get(name)
 
@@ -195,8 +281,8 @@ def _host(name: str) -> str:
 @asynccontextmanager
 async def session() -> AsyncIterator[None]:
     """Validate Linux SSH configuration for the server lifetime."""
-    if _hosts:
-        raise RuntimeError("Linux hosts are already initialized")
+    if _hosts or _files:
+        raise RuntimeError("Linux configuration is already initialized")
 
     if shutil.which("ssh") is None:
         raise RuntimeError("OpenSSH client is not installed")
@@ -211,12 +297,14 @@ async def session() -> AsyncIterator[None]:
         raise RuntimeError(f"Linux known_hosts file does not exist: {known_hosts}")
 
     _hosts.update(_configured_hosts())
+    _files.update(_configured_files())
 
     try:
         yield
 
     finally:
         _hosts.clear()
+        _files.clear()
 
 
 async def _run(
@@ -277,7 +365,7 @@ async def _run(
         ) from exc
 
     if check and process.returncode:
-        message = stderr.decode(errors="replace").strip()
+        message = redact_text(stderr.decode(errors="replace").strip())
 
         if len(message) > 500:
             message = message[:500] + "..."
@@ -379,6 +467,13 @@ def _virtual_interface(name: str) -> bool:
         or bool(_DOCKER_BRIDGE.fullmatch(name))
     )
 
+
+def _service_ref(value: str) -> str:
+    if not _SERVICE_REF.fullmatch(value):
+        raise RuntimeError(f"Invalid systemd service name {value!r}")
+
+    return value
+    
 
 # -------------------------------------------------------------------------------------------------
 # MCP tools
@@ -737,7 +832,7 @@ async def get_linux_services(
                 active_state=fields[2],
                 sub_state=fields[3],
                 description=(
-                    fields[4]
+                    redact_text(fields[4])
                     if len(fields) == 5
                     else ""
                 ),
@@ -765,10 +860,263 @@ async def get_linux_services(
     )
 
 
+async def get_linux_service(
+    host: str,
+    service: str,
+) -> LinuxServiceDetails:
+    """Get detailed systemd state for one Linux service."""
+    service = _service_ref(service)
+
+    output = await _run(
+        host,
+        "systemctl",
+        "--no-pager",
+        "--property="
+        "Id,Description,LoadState,ActiveState,SubState,"
+        "UnitFileState,Result,MainPID,ExecMainStatus,NRestarts",
+        "show",
+        service,
+    )
+
+    properties = dict(
+        line.split("=", 1)
+        for line in output.splitlines()
+        if "=" in line
+    )
+
+    main_pid = int(properties.get("MainPID") or 0)
+    exec_main_status = properties.get("ExecMainStatus")
+
+    return LinuxServiceDetails(
+        host=host,
+        name=properties.get("Id", service),
+        description=redact_text(properties.get("Description", "")),
+        load_state=properties.get("LoadState", ""),
+        active_state=properties.get("ActiveState", ""),
+        sub_state=properties.get("SubState", ""),
+        unit_file_state=(properties.get("UnitFileState") or None),
+        result=properties.get("Result") or None,
+        main_pid=main_pid or None,
+        exec_main_status=(
+            int(exec_main_status)
+            if exec_main_status
+            else None
+        ),
+        restart_count=int(properties.get("NRestarts") or 0),
+    )
+
+
+async def get_linux_journal(
+    host: str,
+    unit: str | None = None,
+    priority: Literal[
+        "emerg",
+        "alert",
+        "crit",
+        "err",
+        "warning",
+        "notice",
+        "info",
+        "debug",
+    ] | None = None,
+    since_seconds: int = 3600,
+    limit: int = 200,
+) -> LinuxJournal:
+    """
+    Get recent systemd journal entries from a Linux host.
+
+    Optionally filters by service unit and priority. Results are bounded by time and entry count.
+    """
+    if not 1 <= since_seconds <= 604800:
+        raise RuntimeError("since_seconds must be between 1 and 604800")
+
+    if not 1 <= limit <= 1000:
+        raise RuntimeError("limit must be between 1 and 1000")
+
+    command = [
+        "journalctl",
+        "--quiet",
+        "--no-pager",
+        "--output=json",
+        "--output-fields="
+        "PRIORITY,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_PID,MESSAGE",
+        f"--since=-{since_seconds}s",
+        f"--lines={limit}",
+    ]
+
+    if unit is not None:
+        command.append(f"--unit={_service_ref(unit)}")
+
+    if priority is not None:
+        command.append(f"--priority={priority}")
+
+    output = await _run(host, *command)
+    entries: list[LinuxJournalEntry] = []
+
+    for line in output.splitlines():
+        if not line:
+            continue
+
+        try:
+            item = json.loads(line)
+
+        except json.JSONDecodeError as exc:
+            raise LinuxRequestError(f"Linux host {host!r} returned invalid journal JSON") from exc
+
+        if not isinstance(item, dict):
+            continue
+
+        raw_priority = item.get("PRIORITY")
+        priority_number = (
+            int(raw_priority)
+            if str(raw_priority).isdigit()
+            else -1
+        )
+
+        raw_pid = item.get("_PID")
+
+        entries.append(
+            LinuxJournalEntry(
+                timestamp_us=int(item.get("__REALTIME_TIMESTAMP") or 0),
+                priority=(
+                    _JOURNAL_PRIORITIES[priority_number]
+                    if 0 <= priority_number
+                    < len(_JOURNAL_PRIORITIES)
+                    else None
+                ),
+                unit=(
+                    str(item["_SYSTEMD_UNIT"])
+                    if item.get("_SYSTEMD_UNIT")
+                    else None
+                ),
+                identifier=(
+                    str(item["SYSLOG_IDENTIFIER"])
+                    if item.get("SYSLOG_IDENTIFIER")
+                    else None
+                ),
+                pid=(
+                    int(raw_pid)
+                    if str(raw_pid).isdigit()
+                    else None
+                ),
+                message=redact_text(str(item.get("MESSAGE") or "")),
+            )
+        )
+
+    return LinuxJournal(
+        host=host,
+        entries=entries,
+    )
+
+
+async def read_linux_file(
+    host: str,
+    path: str,
+) -> LinuxFile:
+    """
+    Attempt to read one explicitly approved configuration file.
+
+    The path must exactly match an entry in LINUX_FILES. Returns file metadata even when the 
+    configured SSH account cannot read the content. Text content is bounded and redacted before
+    being returned.
+    """
+    if path not in _files:
+        raise RuntimeError(f"File path {path!r} is not approved")
+
+    metadata = await _run(
+        host,
+        "stat",
+        "--dereference",
+        r"--printf=%F\n%s\n%a\n%u\n%g\n%U\n%G\n%Y\n",
+        "--",
+        path,
+    )
+
+    fields = metadata.splitlines()
+
+    if len(fields) != 8:
+        raise LinuxRequestError(
+            f"Linux host {host!r} returned invalid stat information for {path!r}"
+        )
+
+    (
+        file_type,
+        raw_size,
+        raw_mode,
+        raw_uid,
+        raw_gid,
+        owner,
+        group,
+        raw_modified,
+    ) = fields
+
+    try:
+        size_bytes = int(raw_size)
+        mode = f"{int(raw_mode, 8):04o}"
+        uid = int(raw_uid)
+        gid = int(raw_gid)
+        modified_at_epoch = int(raw_modified)
+
+    except ValueError as exc:
+        raise LinuxRequestError(
+            f"Linux host {host!r} returned invalid stat information for {path!r}"
+        ) from exc
+
+    content: str | None = None
+    read_error: str | None = None
+
+    if file_type != "regular file":
+        read_error = "Path does not resolve to a regular file"
+
+    elif size_bytes > _MAX_FILE_BYTES:
+        read_error = f"File exceeds the {_MAX_FILE_BYTES}-byte limit"
+
+    else:
+        try:
+            raw_content = await _run(
+                host,
+                "head",
+                f"--bytes={_MAX_FILE_BYTES + 1}",
+                "--",
+                path,
+            )
+
+            if len(raw_content.encode()) > _MAX_FILE_BYTES:
+                read_error = "File exceeded the size limit while being read"
+
+            elif "\0" in raw_content:
+                read_error = "File is not text"
+
+            else:
+                content = redact_text(raw_content)
+
+        except LinuxRequestError as exc:
+            read_error = str(exc)
+
+    return LinuxFile(
+        host=host,
+        path=path,
+        file_type=file_type,
+        size_bytes=size_bytes,
+        mode=mode,
+        uid=uid,
+        gid=gid,
+        owner=owner,
+        group=group,
+        modified_at_epoch=modified_at_epoch,
+        content=content,
+        redacted=(content is not None and content != raw_content),
+        read_error=read_error
+    )
+
+
 TOOLS = (
     list_linux_hosts,
     get_linux_status,
     get_linux_storage,
     get_linux_network,
     get_linux_services,
+    get_linux_service,
+    get_linux_journal,
+    read_linux_file,
 )
