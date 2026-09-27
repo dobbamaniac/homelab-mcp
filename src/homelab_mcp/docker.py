@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -14,6 +15,7 @@ from homelab_mcp.http import (
     get as http_get,
     json_data,
 )
+from homelab_mcp.redact import redact_mapping, redact_text
 from homelab_mcp.utils import pick, pick_all, require_env
 
 
@@ -265,6 +267,18 @@ def _container_ref(value: str) -> str:
     return value
 
 
+async def _inspect_container(
+    host: str,
+    container: str,
+) -> tuple[str, dict[str, Any]]:
+    container = _container_ref(container)
+
+    return container, await _get(
+        host,
+        f"containers/{container}/json",
+    )
+
+
 def _memory_used(stats: dict[str, Any]) -> int:
     usage = int(stats.get("usage", 0))
     values = stats.get("stats") or {}
@@ -318,7 +332,7 @@ def _docker_log_chunks(
         return [
             DockerLogChunk(
                 stream="combined",
-                output=data.decode(errors="replace"),
+                output=redact_text(data.decode(errors="replace")),
             )
         ] if data else []
 
@@ -355,7 +369,7 @@ def _docker_log_chunks(
         chunks.append(
             DockerLogChunk(
                 stream=stream_names.get(stream_type, "unknown"),
-                output=payload.decode(errors="replace"),
+                output=redact_text(payload.decode(errors="replace")),
             )
         )
 
@@ -472,8 +486,7 @@ async def get_docker_container(
 
     Environment variables, raw labels, logs, IDs, and healthcheck output are omitted.
     """
-    container = _container_ref(container)
-    data = await _get(host, f"containers/{container}/json")
+    container, data = await _inspect_container(host, container)
 
     config = data.get("Config") or {}
     host_config = data.get("HostConfig") or {}
@@ -553,7 +566,7 @@ async def get_docker_container(
         name=str(data.get("Name", container)).removeprefix("/"),
         image=str(config.get("Image", "")),
         created=str(data.get("Created", "")),
-        state=pick(
+        state=redact_mapping(pick(
             state,
             "Status",
             "Running",
@@ -565,7 +578,7 @@ async def get_docker_container(
             "Error",
             "StartedAt",
             "FinishedAt",
-        ),
+        )),
         health=health,
         compose_project=labels.get("com.docker.compose.project"),
         compose_service=labels.get("com.docker.compose.service"),
@@ -647,12 +660,7 @@ async def get_docker_container_stats(
     container: str,
 ) -> DockerContainerStats:
     """Get one non-streaming runtime resource snapshot for a running Docker container."""
-    container = _container_ref(container)
-
-    inspect = await _get(
-        host,
-        f"containers/{container}/json",
-    )
+    container, inspect = await _inspect_container(host, container)
     state = inspect.get("State") or {}
 
     if not state.get("Running"):
@@ -732,12 +740,7 @@ async def get_docker_container_logs(
             "since_seconds must be between 1 and 604800"
         )
 
-    container = _container_ref(container)
-
-    inspect = await _get(
-        host,
-        f"containers/{container}/json",
-    )
+    container, inspect = await _inspect_container(host, container)
 
     config = inspect.get("Config") or {}
     tty = bool(config.get("Tty", False))
@@ -750,11 +753,7 @@ async def get_docker_container_logs(
     }
 
     if since_seconds is not None:
-        import time
-
-        params["since"] = str(
-            max(int(time.time()) - since_seconds, 0)
-        )
+        params["since"] = str(max(int(time.time()) - since_seconds, 0))
 
     response = await _get_response(
         host,
@@ -789,12 +788,7 @@ async def get_docker_container_health(
             "history_limit must be between 1 and 20"
         )
 
-    container = _container_ref(container)
-
-    data = await _get(
-        host,
-        f"containers/{container}/json",
-    )
+    container, data = await _inspect_container(host, container)
 
     config = data.get("Config") or {}
     state = data.get("State") or {}
@@ -804,7 +798,7 @@ async def get_docker_container_health(
     history: list[DockerHealthLogEntry] = []
 
     for entry in (health.get("Log") or [])[-history_limit:]:
-        output = str(entry.get("Output", ""))
+        output = redact_text(str(entry.get("Output", "")))
 
         if len(output) > 8192:
             output = output[:8192] + "...[truncated]"
@@ -828,7 +822,7 @@ async def get_docker_container_health(
         ),
         failing_streak=int(health.get("FailingStreak", 0)),
         healthcheck=(
-            pick(
+            redact_mapping(pick(
                 healthcheck,
                 "Test",
                 "Interval",
@@ -836,7 +830,7 @@ async def get_docker_container_health(
                 "Retries",
                 "StartPeriod",
                 "StartInterval",
-            )
+            ))
             if healthcheck
             else None
         ),
@@ -850,6 +844,6 @@ TOOLS = (
     get_docker_container,
     list_docker_compose_projects,
     get_docker_container_stats,
-#    get_docker_container_logs,
+    get_docker_container_logs,
     get_docker_container_health,
 )
