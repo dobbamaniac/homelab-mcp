@@ -4,21 +4,52 @@ import asyncio
 import json
 import posixpath
 import re
-import shlex
-import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
+
+from pydantic import Field
 
 from homelab_mcp.redact import redact_text
 from homelab_mcp.utils import require_env
+from homelab_mcp.ssh import (
+    RequestError as LinuxRequestError,
+    host_names as _ssh_hosts,
+    run as _run,
+    run_json as _run_json
+)
 
 
 # -------------------------------------------------------------------------------------------------
 # Structured output
 # -------------------------------------------------------------------------------------------------
+
+
+UnitType = Literal[
+    "service", "socket", "timer", "target", "device", "mount", "automount", "swap", "path", 
+    "slice", "scope"
+]
+
+UnitState = Literal["active", "inactive", "failed", "all"]
+
+JournalPriority = Literal["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
+
+UnitRef = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^[A-Za-z0-9][A-Za-z0-9_.@:-]*"
+            r"\.(?:service|socket|timer|target|device|mount|automount|"
+            r"swap|path|slice|scope)$"
+        )
+    ),
+]
+
+SysctlPrefix = Annotated[
+    str,
+    Field(pattern=r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$"),
+]
 
 
 @dataclass(frozen=True)
@@ -223,18 +254,7 @@ class LinuxFile:
 # -------------------------------------------------------------------------------------------------
 
 
-class LinuxRequestError(RuntimeError):
-    pass
-
-
-_hosts: dict[str, str] = {}
 _files: set[str] = set()
-
-_SSH_TIMEOUT = 15.0
-_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
-
-_HOST_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-_HOST_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
 
 _PSEUDO_FILESYSTEMS = {
     "devtmpfs", "tmpfs", "proc", "sysfs", "cgroup", "cgroup2", "devpts", "securityfs", "debugfs", 
@@ -243,53 +263,9 @@ _PSEUDO_FILESYSTEMS = {
 
 _DOCKER_BRIDGE = re.compile(r"br-[0-9a-f]{12}")
 
-_UNIT_REF = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9_.@:-]*"
-    r"\.(?:service|socket|timer|target|device|mount|automount|"
-    r"swap|path|slice|scope)"
-)
 _JOURNAL_PRIORITIES = ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")
-_SYSTEMD_CONFIGS = {
-    "system": "systemd/system.conf",
-    "journald": "systemd/journald.conf",
-    "logind": "systemd/logind.conf",
-    "resolved": "systemd/resolved.conf",
-    "timesyncd": "systemd/timesyncd.conf",
-    "networkd": "systemd/networkd.conf",
-    "oomd": "systemd/oomd.conf",
-    "sysctl": "sysctl.d",
-}
-_SYSCTL_REF = re.compile(
-    r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*"
-)
 
 _MAX_FILE_BYTES = 128 * 1024
-
-
-def _configured_hosts() -> dict[str, str]:
-    value = require_env("LINUX_HOSTS")
-    hosts: dict[str, str] = {}
-
-    for entry in value.split(","):
-        name, separator, target = entry.partition("=")
-        name = name.strip()
-        target = target.strip()
-
-        if not separator or not name or not target:
-            raise RuntimeError("LINUX_HOSTS must use name=host entries separated by commas")
-
-        if not _HOST_REF.fullmatch(name):
-            raise RuntimeError(f"Invalid Linux host name {name!r}")
-
-        if not _HOST_TARGET.fullmatch(target):
-            raise RuntimeError(f"Invalid Linux SSH target {target!r}")
-
-        if name in hosts:
-            raise RuntimeError(f"Duplicate Linux host {name!r}")
-
-        hosts[name] = target
-
-    return hosts
 
 
 def _configured_files() -> set[str]:
@@ -314,124 +290,19 @@ def _configured_files() -> set[str]:
     return files
 
 
-def _host(name: str) -> str:
-    target = _hosts.get(name)
-
-    if target is None:
-        raise RuntimeError(f"Linux host {name!r} is not configured")
-
-    return target
-
-
 @asynccontextmanager
 async def session() -> AsyncIterator[None]:
     """Validate Linux SSH configuration for the server lifetime."""
-    if _hosts or _files:
+    if _files:
         raise RuntimeError("Linux configuration is already initialized")
 
-    if shutil.which("ssh") is None:
-        raise RuntimeError("OpenSSH client is not installed")
-
-    key = Path(require_env("LINUX_SSH_KEY"))
-    known_hosts = Path(require_env("LINUX_KNOWN_HOSTS"))
-
-    if not key.is_file():
-        raise RuntimeError(f"Linux SSH key does not exist: {key}")
-
-    if not known_hosts.is_file():
-        raise RuntimeError(f"Linux known_hosts file does not exist: {known_hosts}")
-
-    _hosts.update(_configured_hosts())
     _files.update(_configured_files())
 
     try:
         yield
 
     finally:
-        _hosts.clear()
         _files.clear()
-
-
-async def _run(
-    host: str,
-    *command: str,
-    check: bool = True,
-) -> str:
-    if not command:
-        raise RuntimeError("Linux command cannot be empty")
-
-    target = _host(host)
-    user = require_env("LINUX_SSH_USER")
-    key = require_env("LINUX_SSH_KEY")
-    known_hosts = require_env("LINUX_KNOWN_HOSTS")
-
-    remote_command = shlex.join((
-        "env",
-        "LC_ALL=C",
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        *command,
-    ))
-
-    process = await asyncio.create_subprocess_exec(
-        "ssh", "-F", "/dev/null", "-T", "-i", key, "-o", "BatchMode=yes", 
-        "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes", 
-        "-o", f"UserKnownHostsFile={known_hosts}", "-o", "GlobalKnownHostsFile=/dev/null", 
-        "-o", "UpdateHostKeys=no", "-o", f"HostKeyAlias={host}", "-o", "ClearAllForwardings=yes", 
-        "-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1", "-o", "LogLevel=ERROR", 
-        f"{user}@{target}", remote_command, stdin=asyncio.subprocess.DEVNULL, 
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=_SSH_TIMEOUT,
-        )
-
-    except TimeoutError as exc:
-        process.kill()
-        await process.communicate()
-
-        raise LinuxRequestError(
-            f"Linux host {host!r} timed out running {command[0]!r}"
-        ) from exc
-
-    if check and process.returncode:
-        message = redact_text(stderr.decode(errors="replace").strip())
-
-        if len(message) > 500:
-            message = message[:500] + "..."
-
-        raise LinuxRequestError(
-            f"Linux host {host!r} returned exit status {process.returncode} for {command[0]!r}"
-            + (f": {message}" if message else "")
-        )
-
-    if len(stdout) > _MAX_OUTPUT_BYTES:
-        raise LinuxRequestError(f"Linux host {host!r} returned too much output for {command[0]!r}")
-
-    try:
-        return stdout.decode()
-
-    except UnicodeDecodeError as exc:
-        raise LinuxRequestError(
-            f"Linux host {host!r} returned invalid text for {command[0]!r}"
-        ) from exc
-
-
-async def _run_json(
-    host: str,
-    *command: str,
-) -> Any:
-    output = await _run(host, *command)
-
-    try:
-        return json.loads(output)
-
-    except json.JSONDecodeError as exc:
-        raise LinuxRequestError(
-            f"Linux host {host!r} returned invalid JSON for {command[0]!r}"
-        ) from exc
 
 
 def _meminfo(value: str) -> dict[str, int]:
@@ -453,13 +324,9 @@ def _meminfo(value: str) -> dict[str, int]:
 def _flatten(
     items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    flattened: list[dict[str, Any]] = []
-
     for item in items:
-        flattened.append(item)
-        flattened.extend(_flatten(item.get("children") or []))
-
-    return flattened
+        yield item
+        yield from _flatten(item.get("children") or [])
 
 
 def _dns_servers(value: str) -> list[str]:
@@ -493,20 +360,6 @@ def _virtual_interface(name: str) -> bool:
         or bool(_DOCKER_BRIDGE.fullmatch(name))
     )
 
-
-def _unit_ref(value: str) -> str:
-    if not _UNIT_REF.fullmatch(value):
-        raise RuntimeError(f"Invalid systemd unit name {value!r}")
-
-    return value
-
-
-def _sysctl_ref(value: str) -> str:
-    if not _SYSCTL_REF.fullmatch(value):
-        raise RuntimeError(f"Invalid sysctl prefix {value!r}")
-
-    return value
-    
 
 # -------------------------------------------------------------------------------------------------
 # MCP tools
@@ -545,7 +398,7 @@ async def list_linux_hosts() -> LinuxHosts:
     """List configured Linux hosts and compact operating-system information."""
     hosts = await asyncio.gather(*(
         _get_linux_host(name)
-        for name in sorted(_hosts)
+        for name in _ssh_hosts()
     ))
 
     return LinuxHosts(hosts=list(hosts))
@@ -819,11 +672,8 @@ async def list_linux_packages(
 
 async def list_linux_units(
     host: str,
-    type: Literal[
-        "service", "socket", "timer", "target", "device", "mount", "automount", "swap", "path", 
-        "slice", "scope"
-    ] = "service",
-    state: Literal["active", "inactive", "failed", "all"] = "active",
+    type: UnitType = "service",
+    state: UnitState = "active",
 ) -> LinuxUnits:
     """
     List loaded systemd units on a Linux host.
@@ -878,11 +728,9 @@ async def list_linux_units(
 
 async def get_linux_unit(
     host: str,
-    unit: str,
+    unit: UnitRef,
 ) -> LinuxUnitDetails:
     """Get state and configuration provenance for one systemd unit."""
-    unit = _unit_ref(unit)
-
     output = await _run(
         host, "systemctl", "--no-pager", 
         "--property=" "Id,Description,LoadState,ActiveState,SubState," 
@@ -914,10 +762,7 @@ async def get_linux_unit(
 
 async def get_linux_unit_files(
     host: str,
-    type: Literal[
-        "service", "socket", "timer", "target", "device", "mount", "automount", "swap", "path", 
-        "slice", "scope"
-    ] = "service"
+    type: UnitType = "service"
 ) -> LinuxUnitFiles:
     """List installed systemd unit files and their enablement state."""
 
@@ -956,24 +801,16 @@ async def get_linux_unit_files(
 
 async def get_linux_journal(
     host: str,
-    unit: str | None = None,
-    priority: Literal[
-        "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"
-    ] | None = None,
-    since_seconds: int = 3600,
-    limit: int = 200,
+    unit: UnitRef | None = None,
+    priority: JournalPriority | None = None,
+    since_seconds: Annotated[int, Field(ge=1, le=604800)] = 3600,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 200,
 ) -> LinuxJournal:
     """
     Get recent systemd journal entries from a Linux host.
 
     Optionally filters by systemd unit and priority. Results are bounded by time and entry count.
     """
-    if not 1 <= since_seconds <= 604800:
-        raise RuntimeError("since_seconds must be between 1 and 604800")
-
-    if not 1 <= limit <= 1000:
-        raise RuntimeError("limit must be between 1 and 1000")
-
     command = [
         "journalctl", "--quiet", "--no-pager", "--output=json", 
         "--output-fields=" "PRIORITY,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_PID,MESSAGE", 
@@ -981,7 +818,7 @@ async def get_linux_journal(
     ]
 
     if unit is not None:
-        command.append(f"--unit={_unit_ref(unit)}")
+        command.append(f"--unit={unit}")
 
     if priority is not None:
         command.append(f"--priority={priority}")
@@ -1049,15 +886,13 @@ async def get_linux_journal(
 
 async def get_linux_sysctls(
     host: str,
-    prefix: str,
+    prefix: SysctlsPrefix,
 ) -> LinuxSysctls:
     """
     Get current kernel sysctl values below a prefix.
 
     The prefix must use dotted sysctl notation, such as "net.ipv4" or "vm".
     """
-    prefix = _sysctl_ref(prefix)
-
     pattern = "^" + prefix.replace(".", r"\.") + r"(\.|$)"
 
     output = await _run(host, "sysctl", "--all", "--pattern", pattern)

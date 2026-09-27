@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import httpx
+from pydantic import Field
 
 from homelab_mcp.http import get_json
 from homelab_mcp.utils import pick, pick_all, require_env
@@ -157,10 +159,12 @@ async def _get(
 
 async def get_pfsense_system() -> pfSenseSystem:
     """Get pfSense system, version, service, and installed-package status."""
-    status = await _get("status/system")
-    version = await _get("system/version")
-    services = await _get("status/services")
-    packages = await _get("system/packages")
+    status, version, services, packages = await asyncio.gather(
+        _get("status/system"),
+        _get("system/version"),
+        _get("status/services"),
+        _get("system/packages"),
+    )
 
     return pfSenseSystem(
         status=pick(
@@ -179,12 +183,14 @@ async def get_pfsense_system() -> pfSenseSystem:
 
 async def get_pfsense_interfaces() -> pfSenseInterfaces:
     """Get pfSense interface configuration, topology, and runtime status."""
-    interfaces = await _get("interfaces")
-    status = await _get("status/interfaces")
-    vlans = await _get("interface/vlans")
-    groups = await _get("interface/groups")
-    laggs = await _get("interface/laggs")
-    bridges = await _get("interface/bridges")
+    interfaces, status, vlans, groups, laggs, bridges = await asyncio.gather(
+        _get("interfaces"),
+        _get("status/interfaces"),
+        _get("interface/vlans"),
+        _get("interface/groups"),
+        _get("interface/laggs"),
+        _get("interface/bridges"),
+    )
 
     return pfSenseInterfaces(
         interfaces=pick_all(
@@ -205,11 +211,13 @@ async def get_pfsense_interfaces() -> pfSenseInterfaces:
 
 async def get_pfsense_routing() -> pfSenseRouting:
     """Get pfSense gateway, gateway-group, route, and gateway status."""
-    default_gateway = await _get("routing/gateway/default")
-    gateways = await _get("routing/gateways")
-    status = await _get("status/gateways")
-    gateway_groups = await _get("routing/gateway/groups")
-    static_routes = await _get("routing/static_routes")
+    default_gateway, gateways, status, gateway_groups, static_routes = await asyncio.gather(
+        _get("routing/gateway/default"),
+        _get("routing/gateways"),
+        _get("status/gateways"),
+        _get("routing/gateway/groups"),
+        _get("routing/static_routes"),
+    )
 
     return pfSenseRouting(
         default_gateway=default_gateway,
@@ -228,14 +236,19 @@ async def get_pfsense_routing() -> pfSenseRouting:
 
 async def get_pfsense_firewall() -> pfSenseFirewall:
     """Get pfSense firewall rules, aliases, NAT, virtual IPs, and state-table size."""
-    rules = await _get("firewall/rules")
-    aliases = await _get("firewall/aliases")
-    port_forwards = await _get("firewall/nat/port_forwards")
-    outbound_nat_mode = await _get("firewall/nat/outbound/mode")
-    outbound_nat = await _get("firewall/nat/outbound/mappings")
-    one_to_one_nat = await _get("firewall/nat/one_to_one/mappings")
-    virtual_ips = await _get("firewall/virtual_ips")
-    state_table_size = await _get("firewall/states/size")
+    (
+        rules, aliases, port_forwards, outbound_nat_mode, outbound_nat, one_to_one_nat, 
+        virtual_ips, state_table_size
+    ) = await asyncio.gather(
+        _get("firewall/rules"),
+        _get("firewall/aliases"),
+        _get("firewall/nat/port_forwards"),
+        _get("firewall/nat/outbound/mode"),
+        _get("firewall/nat/outbound/mappings"),
+        _get("firewall/nat/one_to_one/mappings"),
+        _get("firewall/virtual_ips"),
+        _get("firewall/states/size"),
+    )
 
     return pfSenseFirewall(
         rules=pick_all(
@@ -266,8 +279,10 @@ async def get_pfsense_firewall() -> pfSenseFirewall:
 
 async def get_pfsense_clients() -> pfSenseClients:
     """Get pfSense ARP entries and current DHCP leases."""
-    arp_table = await _get("diagnostics/arp_table")
-    dhcp_leases = await _get("status/dhcp_server/leases")
+    arp_table, dhcp_leases = await asyncio.gather(
+        _get("diagnostics/arp_table"),
+        _get("status/dhcp_server/leases"),
+    )
 
     return pfSenseClients(
         arp_table=pick_all(
@@ -283,11 +298,15 @@ async def get_pfsense_clients() -> pfSenseClients:
 
 async def get_pfsense_network_services() -> pfSenseNetworkServices:
     """Get pfSense DHCP and DNS configuration relevant to local network services."""
-    dhcp_servers = await _get("services/dhcp_servers")
-    dns_resolver = await _get("services/dns_resolver/settings")
-    dns_host_overrides = await _get("services/dns_resolver/host_overrides")
-    dns_domain_overrides = await _get("services/dns_resolver/domain_overrides")
-    system_dns = await _get("system/dns")
+    (
+        dhcp_servers, dns_resolver, dns_host_overrides, dns_domain_overrides, system_dns
+    ) = await asyncio.gather(
+        _get("services/dhcp_servers"),
+        _get("services/dns_resolver/settings"),
+        _get("services/dns_resolver/host_overrides"),
+        _get("services/dns_resolver/domain_overrides"),
+        _get("system/dns"),
+    )
 
     static_mappings: dict[str, list[dict[str, Any]]] = {}
     address_pools: dict[str, list[dict[str, Any]]] = {}
@@ -296,13 +315,15 @@ async def get_pfsense_network_services() -> pfSenseNetworkServices:
         interface = str(server["id"])
         params = {"parent_id": interface}
 
-        mappings = await _get(
-            "services/dhcp_server/static_mappings",
-            params=params,
-        )
-        pools = await _get(
-            "services/dhcp_server/address_pools",
-            params=params,
+        mappings, pools = await asyncio.gather(
+            _get(
+                "services/dhcp_server/static_mappings",
+                params=params,
+            ),
+            _get(
+                "services/dhcp_server/address_pools",
+                params=params,
+            ),
         )
 
         static_mappings[interface] = pick_all(
@@ -339,15 +360,18 @@ async def get_pfsense_network_services() -> pfSenseNetworkServices:
 
 async def get_pfsense_vpn_status() -> pfSenseVPNStatus:
     """Get current WireGuard, OpenVPN, and IPsec runtime status."""
-    wireguard_tunnels = await _get("status/wireguard/tunnels")
-    wireguard_peers = await _get("status/wireguard/peers")
-
-    openvpn_servers = await _get("status/openvpn/servers")
-    openvpn_clients = await _get("status/openvpn/clients")
-    openvpn_connections = await _get("status/openvpn/server/connections")
-
-    ipsec_sas = await _get("status/ipsec/sas")
-    ipsec_child_sas = await _get("status/ipsec/child_sas")
+    (
+        wireguard_tunnels, wireguard_peers, openvpn_servers, openvpn_clients, openvpn_connections, 
+        ipsec_sas, ipsec_child_sas,
+    ) = await asyncio.gather(
+        _get("status/wireguard/tunnels"),
+        _get("status/wireguard/peers"),
+        _get("status/openvpn/servers"),
+        _get("status/openvpn/clients"),
+        _get("status/openvpn/server/connections"),
+        _get("status/ipsec/sas"),
+        _get("status/ipsec/child_sas"),
+    )
 
     return pfSenseVPNStatus(
         wireguard_tunnels=pick_all(
@@ -368,12 +392,9 @@ async def get_pfsense_vpn_status() -> pfSenseVPNStatus:
 
 async def get_pfsense_logs(
     log: LogKind,
-    limit: int = 50,
+    limit: Annotated[int, Field(ge=1, le=200)] = 50,
 ) -> pfSenseLogs:
     """Get recent entries from one pfSense diagnostic log."""
-    if not 1 <= limit <= 200:
-        raise ValueError("limit must be between 1 and 200")
-
     entries = await _get(
         _LOG_PATHS[log],
         params={

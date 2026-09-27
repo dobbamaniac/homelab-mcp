@@ -6,9 +6,10 @@ from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
+from pydantic import Field
 
 from homelab_mcp.http import (
     RequestError as DockerRequestError,
@@ -679,8 +680,8 @@ async def get_docker_container_stats(
 async def get_docker_container_logs(
     host: str,
     container: str,
-    tail: int = 200,
-    since_seconds: int | None = None,
+    tail: Annotated[int, Field(ge=1, le=1000)] = 200,
+    since_seconds: Annotated[int, Field(ge=1, le=604800)] | None = None,
 ) -> DockerContainerLogs:
     """
     Get recent stdout/stderr logs for a Docker container.
@@ -688,14 +689,6 @@ async def get_docker_container_logs(
     `tail` is limited to 1-1000 lines. `since_seconds`, when provided,
     restricts output to approximately that many seconds of recent logs.
     """
-    if not 1 <= tail <= 1000:
-        raise RuntimeError("tail must be between 1 and 1000")
-
-    if since_seconds is not None and not 1 <= since_seconds <= 604800:
-        raise RuntimeError(
-            "since_seconds must be between 1 and 604800"
-        )
-
     container, inspect = await _inspect_container(host, container)
 
     config = inspect.get("Config") or {}
@@ -726,7 +719,7 @@ async def get_docker_container_logs(
 async def get_docker_container_health(
     host: str,
     container: str,
-    history_limit: int = 10,
+    history_limit: Annotated[int, Field(ge=1, le=20)] = 10,
 ) -> DockerContainerHealth:
     """
     Get Docker healthcheck configuration, status, and recent results.
@@ -734,11 +727,6 @@ async def get_docker_container_health(
     Includes healthcheck command output that is intentionally omitted from
     get_docker_container().
     """
-    if not 1 <= history_limit <= 20:
-        raise RuntimeError(
-            "history_limit must be between 1 and 20"
-        )
-
     container, data = await _inspect_container(host, container)
 
     config = data.get("Config") or {}

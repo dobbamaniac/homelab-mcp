@@ -4,8 +4,8 @@ set -euo pipefail
 fqdn="${1:?Usage: $0 HOST.EXAMPLE.TLD}"
 host="${fqdn%%.*}"
 
-pubkey="${LINUX_MCP_PUBLIC_KEY:-secrets/linux_ssh_key.pub}"
-known_hosts="${LINUX_MCP_KNOWN_HOSTS:-secrets/linux_known_hosts}"
+pubkey="${LINUX_MCP_PUBLIC_KEY:-secrets/ssh_key.pub}"
+known_hosts="${LINUX_MCP_KNOWN_HOSTS:-secrets/known_hosts}"
 
 if [[ ! -r "$pubkey" ]]; then
     echo "Public key is not readable: $pubkey" >&2

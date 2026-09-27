@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 import httpx
+from pydantic import Field
 
 from homelab_mcp.http import RequestError, get_json
 from homelab_mcp.utils import pick, pick_all, require_env
@@ -471,32 +473,18 @@ async def get_proxmox_node_status(node: str) -> ProxmoxNodeStatus:
     Includes the status information exposed by Proxmox for CPU, memory, swap, load, uptime, kernel,
     PVE version, and related host metrics.
     """
-    status = await _get(f"nodes/{node}/status")
-    version = await _get(f"nodes/{node}/version")
+    status, version = await asyncio.gather(
+        _get(f"nodes/{node}/status"),
+        _get(f"nodes/{node}/version"),
+    )
 
     status = pick(
-        status,
-        "cpu",
-        "uptime",
-        "loadavg",
-        "memory",
-        "swap",
-        "rootfs",
-        "ksm",
-        "boot-info",
-        "current-kernel",
-        "cpuinfo",
+        status, "cpu", "uptime", "loadavg", "memory", "swap", "rootfs", "ksm", "boot-info", 
+        "current-kernel", "cpuinfo"
     )
 
     status["cpuinfo"] = pick(
-        status.get("cpuinfo") or {},
-        "model",
-        "vendor",
-        "sockets",
-        "cores",
-        "cpus",
-        "mhz",
-        "hvm",
+        status.get("cpuinfo") or {}, "model", "vendor", "sockets", "cores", "cpus", "mhz", "hvm"
     )
 
     version = pick(version, "version", "repoid")
@@ -515,35 +503,20 @@ async def get_proxmox_storage_health(node: str) -> ProxmoxStorageHealth:
     Combines local disk inventory with ZFS pool summaries and detailed status for each detected ZFS
     pool.
     """
-    disks = await _get(
-        f"nodes/{node}/disks/list",
-        params={"include-partitions": "0"},
+    disks, zpools = await asyncio.gather(
+        _get(
+            f"nodes/{node}/disks/list",
+            params={"include-partitions": "0"},
+        ),
+        _get(f"nodes/{node}/disks/zfs"),
     )
-    zpools = await _get(f"nodes/{node}/disks/zfs")
 
     disks = pick_all(
-        disks,
-        "devpath",
-        "by_id_link",
-        "type",
-        "model",
-        "serial",
-        "size",
-        "health",
-        "wearout",
-        "used",
-        "rpm",
+        disks, "devpath", "by_id_link", "type", "model", "serial", "size", "health", "wearout", 
+        "used", "rpm"
     )
 
-    zpools = pick_all(
-        zpools,
-        "name",
-        "health",
-        "size",
-        "alloc",
-        "free",
-        "frag",
-    )
+    zpools = pick_all(zpools, "name", "health", "size", "alloc", "free", "frag")
 
     zpool_details: dict[str, dict[str, Any]] = {}
 
@@ -574,15 +547,16 @@ async def get_proxmox_backup_status() -> ProxmoxBackupStatus:
 
     This is a read-only overview intended for backup auditing.
     """
-    jobs = await _get("cluster/backup")
-    not_backed_up = await _get("cluster/backup-info/not-backed-up")
+    jobs, not_backed_up, recent_tasks = await asyncio.gather(
+        _get("cluster/backup"),
+        _get("cluster/backup-info/not-backed-up"),
+        list_proxmox_tasks(typefilter="vzdump", limit=10),
+    )
+
+    recent_tasks_by_node = recent_tasks.tasks_by_node
 
     _remove_key(jobs, "digest")
     _remove_key(not_backed_up, "digest")
-
-    recent_tasks_by_node = (
-        await list_proxmox_tasks(typefilter="vzdump", limit=10)
-    ).tasks_by_node
 
     jobs.sort(key=lambda job: str(job.get("id", "")))
     not_backed_up.sort(key=lambda guest: int(guest.get("vmid", 0)))
@@ -674,7 +648,7 @@ async def list_proxmox_tasks(
     node: str | None = None,
     typefilter: str | None = None,
     errors_only: bool = False,
-    limit: int = 20,
+    limit: Annotated[int, Field(ge=1, le=200)] = 20
 ) -> ProxmoxTasks:
     """
     List recent Proxmox VE tasks from one node or all online nodes.
@@ -682,9 +656,6 @@ async def list_proxmox_tasks(
     Supports optional task-type filtering and filtering to completed failures. Use 
     get_proxmox_task() with a returned UPID for detailed status and log.
     """
-    if limit < 1 or limit > 200:
-        raise ValueError("limit must be between 1 and 200")
-
     nodes = [node] if node else await _list_online_nodes()
 
     tasks_by_node: dict[
@@ -723,18 +694,12 @@ async def list_proxmox_tasks(
 async def get_proxmox_task(
     node: str,
     upid: str,
-    log_limit: int = 200,
-    log_start: int = 0,
+    log_limit: Annotated[int, Field(ge=1, le=1000)] = 200,
+    log_start: Annotated[int, Field(ge=0)] = 0,
 ) -> ProxmoxTask:
     """
     Get status and log output for one Proxmox VE task.
     """
-    if log_limit < 1 or log_limit > 1000:
-        raise ValueError("log_limit must be between 1 and 1000")
-
-    if log_start < 0:
-        raise ValueError("log_start must be non-negative")
-
     status = await _get(f"nodes/{node}/tasks/{upid}/status")
     _drop(status, "node", "upid")
 
@@ -763,25 +728,15 @@ async def get_proxmox_guest_runtime(vmid: int) -> ProxmoxGuestRuntime:
 
     base_path = f"nodes/{guest.node}/{guest.kind}/{guest.vmid}"
 
-    current = await _get(f"{base_path}/status/current")
-    pending = await _get(f"{base_path}/pending")
-    snapshots = await _get(f"{base_path}/snapshot")
+    current, pending, snapshots = await asyncio.gather(
+        _get(f"{base_path}/status/current"),
+        _get(f"{base_path}/pending"),
+        _get(f"{base_path}/snapshot"),
+    )
 
     current = pick(
-        current,
-        "status",
-        "uptime",
-        "cpu",
-        "cpus",
-        "mem",
-        "maxmem",
-        "disk",
-        "maxdisk",
-        "netin",
-        "netout",
-        "pid",
-        "qmpstatus",
-        "ha",
+        current, "status", "uptime", "cpu", "cpus", "mem", "maxmem", "disk", "maxdisk", "netin", 
+        "netout", "pid", "qmpstatus", "ha"
     )
 
     pending = [
@@ -797,10 +752,12 @@ async def get_proxmox_guest_runtime(vmid: int) -> ProxmoxGuestRuntime:
     if guest.kind == "qemu":
         agent_base = f"{base_path}/agent"
 
-        info = await _try_get(f"{agent_base}/info")
-        network_interfaces = await _try_get(f"{agent_base}/network-get-interfaces")
-        filesystems = await _try_get(f"{agent_base}/get-fsinfo")
-        os_info = await _try_get(f"{agent_base}/get-osinfo")
+        info, network_interfaces, filesystems, os_info = await asyncio.gather(
+            _try_get(f"{agent_base}/info"),
+            _try_get(f"{agent_base}/network-get-interfaces"),
+            _try_get(f"{agent_base}/get-fsinfo"),
+            _try_get(f"{agent_base}/get-osinfo"),
+        )
 
         if info["ok"]:
             info["data"].get("result", {}).pop("supported_commands", None)
@@ -849,10 +806,13 @@ async def get_proxmox_node_software(node: str) -> ProxmoxNodeSoftware:
     Deliberately excludes /apt/update because that endpoint requires Sys.Modify and may refresh the
     APT package cache.
     """
-    repositories = await _get(f"nodes/{node}/apt/repositories")
-    versions = await _get(f"nodes/{node}/apt/versions")
-    subscription = await _get(f"nodes/{node}/subscription")
-    certificates = await _get(f"nodes/{node}/certificates/info")
+    repositories, versions, subscription, certificates = await asyncio.gather(
+        _get(f"nodes/{node}/apt/repositories"),
+        _get(f"nodes/{node}/apt/versions"),
+        _get(f"nodes/{node}/subscription"),
+        _get(f"nodes/{node}/certificates/info"),
+    )
+
     running_kernel = next(
         (str(package["RunningKernel"]) for package in versions if package.get("RunningKernel")),
         "",
@@ -873,37 +833,17 @@ async def get_proxmox_node_software(node: str) -> ProxmoxNodeSoftware:
     ]
 
     versions = pick_all(
-        versions,
-        "Package",
-        "OldVersion",
-        "Version",
-        "Origin",
-        "Arch",
-        "ManagerVersion",
+        versions, "Package", "OldVersion", "Version", "Origin", "Arch", "ManagerVersion"
     )
 
     subscription = pick(
-        subscription,
-        "status",
-        "level",
-        "productname",
-        "regdate",
-        "nextduedate",
-        "message",
-        "sockets",
+        subscription, "status", "level", "productname", "regdate", "nextduedate", "message", 
+        "sockets"
     )
 
     certificates = pick_all(
-        certificates,
-        "filename",
-        "subject",
-        "issuer",
-        "san",
-        "fingerprint",
-        "notbefore",
-        "notafter",
-        "public-key-type",
-        "public-key-bits",
+        certificates, "filename", "subject", "issuer", "san", "fingerprint", "notbefore", 
+        "notafter", "public-key-type", "public-key-bits"
     )
 
     versions.sort(key=lambda package: str(package.get("Package", "")))
@@ -945,12 +885,8 @@ async def get_proxmox_hardware(
 
     if not all_devices:
         noisy_devices = (
-            "Registers",
-            "Integrated Memory Controller",
-            "LM Channel",
-            "LMS Channel",
-            "LMDP Channel",
-            "DECS Channel",
+            "Registers", "Integrated Memory Controller", "LM Channel", "LMS Channel", 
+            "LMDP Channel", "DECS Channel"
         )
 
         pci_devices = [
@@ -984,12 +920,14 @@ async def get_proxmox_access_control() -> ProxmoxAccessControl:
 
     Repeated permissions, unused built-in roles, and low-value user metadata are omitted.
     """    
-    effective_permissions = await _get("access/permissions")
-    acls = await _get("access/acl")
-    roles = await _get("access/roles")
-    groups = await _get("access/groups")
-    realms = await _get("access/domains")
-    users = await _get("access/users")
+    effective_permissions, acls, roles, groups, realms, users = await asyncio.gather(
+        _get("access/permissions"),
+        _get("access/acl"),
+        _get("access/roles"),
+        _get("access/groups"),
+        _get("access/domains"),
+        _get("access/users"),
+    )
 
     effective_permissions = {
         path: sorted(privilege for privilege, enabled in permissions.items() if enabled)
