@@ -40,6 +40,7 @@ class DockerHost:
     containers_stopped: int
     images: int
 
+
 @dataclass(frozen=True)
 class DockerHosts:
     hosts: list[DockerHost]
@@ -339,17 +340,11 @@ def _docker_log_chunks(
     chunks: list[DockerLogChunk] = []
     offset = 0
 
-    stream_names = {
-        0: "stdin",
-        1: "stdout",
-        2: "stderr",
-    }
+    stream_names = {0: "stdin", 1: "stdout", 2: "stderr"}
 
     while offset < len(data):
         if len(data) - offset < 8:
-            raise DockerRequestError(
-                "Docker returned a truncated log stream header"
-            )
+            raise DockerRequestError("Docker returned a truncated log stream header")
 
         stream_type = data[offset]
         size = int.from_bytes(
@@ -512,16 +507,7 @@ async def get_docker_container(
     mounts: list[dict[str, Any]] = []
 
     for mount in data.get("Mounts") or []:
-        item = pick(
-            mount,
-            "Type",
-            "Name",
-            "Destination",
-            "Driver",
-            "Mode",
-            "RW",
-            "Propagation",
-        )
+        item = pick(mount, "Type", "Name", "Destination", "Driver", "Mode", "RW", "Propagation")
 
         if mount.get("Type") == "bind" and "Source" in mount:
             item["Source"] = mount["Source"]
@@ -532,15 +518,8 @@ async def get_docker_container(
 
     networks = {
         name: pick(
-            network,
-            "IPAddress",
-            "IPPrefixLen",
-            "Gateway",
-            "GlobalIPv6Address",
-            "GlobalIPv6PrefixLen",
-            "IPv6Gateway",
-            "MacAddress",
-            "Aliases",
+            network, "IPAddress", "IPPrefixLen", "Gateway", "GlobalIPv6Address", 
+            "GlobalIPv6PrefixLen", "IPv6Gateway", "MacAddress", "Aliases"
         )
         for name, network in sorted(
             ((data.get("NetworkSettings") or {}).get("Networks") or {}).items()
@@ -548,14 +527,8 @@ async def get_docker_container(
     }
 
     security = pick(
-        host_config,
-        "CapAdd",
-        "CapDrop",
-        "SecurityOpt",
-        "PidMode",
-        "IpcMode",
-        "UTSMode",
-        "UsernsMode",
+        host_config, "CapAdd", "CapDrop", "SecurityOpt", "PidMode", "IpcMode", "UTSMode", 
+        "UsernsMode"
     )
 
     if data.get("AppArmorProfile"):
@@ -567,17 +540,8 @@ async def get_docker_container(
         image=str(config.get("Image", "")),
         created=str(data.get("Created", "")),
         state=redact_mapping(pick(
-            state,
-            "Status",
-            "Running",
-            "Paused",
-            "Restarting",
-            "OOMKilled",
-            "Dead",
-            "ExitCode",
-            "Error",
-            "StartedAt",
-            "FinishedAt",
+            state, "Status", "Running", "Paused", "Restarting", "OOMKilled", "Dead", "ExitCode", 
+            "Error", "StartedAt", "FinishedAt"
         )),
         health=health,
         compose_project=labels.get("com.docker.compose.project"),
@@ -595,16 +559,8 @@ async def get_docker_container(
         mounts=mounts,
         networks=networks,
         resources=pick(
-            host_config,
-            "Memory",
-            "MemorySwap",
-            "NanoCpus",
-            "CpuShares",
-            "CpuPeriod",
-            "CpuQuota",
-            "CpusetCpus",
-            "PidsLimit",
-            "ShmSize",
+            host_config, "Memory", "MemorySwap", "NanoCpus", "CpuShares", "CpuPeriod", "CpuQuota", 
+            "CpusetCpus", "PidsLimit", "ShmSize"
         ),
         security=security,
         devices=pick_all(
@@ -745,12 +701,7 @@ async def get_docker_container_logs(
     config = inspect.get("Config") or {}
     tty = bool(config.get("Tty", False))
 
-    params = {
-        "stdout": "true",
-        "stderr": "true",
-        "timestamps": "true",
-        "tail": str(tail),
-    }
+    params = {"stdout": "true", "stderr": "true", "timestamps": "true", "tail": str(tail)}
 
     if since_seconds is not None:
         params["since"] = str(max(int(time.time()) - since_seconds, 0))
@@ -823,13 +774,8 @@ async def get_docker_container_health(
         failing_streak=int(health.get("FailingStreak", 0)),
         healthcheck=(
             redact_mapping(pick(
-                healthcheck,
-                "Test",
-                "Interval",
-                "Timeout",
-                "Retries",
-                "StartPeriod",
-                "StartInterval",
+                healthcheck, "Test", "Interval", "Timeout", "Retries", "StartPeriod", 
+                "StartInterval"
             ))
             if healthcheck
             else None

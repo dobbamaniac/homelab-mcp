@@ -16,14 +16,7 @@ from homelab_mcp.utils import pick, pick_all, require_env
 # -------------------------------------------------------------------------------------------------
 
 
-LogKind = Literal[
-    "firewall",
-    "dhcp",
-    "system",
-    "auth",
-    "openvpn",
-    "restapi",
-]
+LogKind = Literal["firewall", "dhcp", "system", "auth", "openvpn", "restapi"]
 
 
 @dataclass(frozen=True)
@@ -171,39 +164,15 @@ async def get_pfsense_system() -> pfSenseSystem:
 
     return pfSenseSystem(
         status=pick(
-            status,
-            "platform",
-            "uptime",
-            "bios_vendor",
-            "bios_version",
-            "bios_date",
-            "kernel_pti",
-            "mds_mitigation",
-            "temp_c",
-            "cpu_model",
-            "cpu_load_avg",
-            "cpu_count",
-            "cpu_usage",
-            "mbuf_usage",
-            "mem_usage",
-            "swap_usage",
-            "disk_usage",
+            status, "platform", "uptime", "bios_vendor", "bios_version", "bios_date", "kernel_pti", 
+            "mds_mitigation", "temp_c", "cpu_model", "cpu_load_avg", "cpu_count", "cpu_usage", 
+            "mbuf_usage", "mem_usage", "swap_usage", "disk_usage"
         ),
         version=version,
-        services=pick_all(
-            services,
-            "name",
-            "description",
-            "enabled",
-            "status",
-        ),
+        services=pick_all(services, "name", "description", "enabled", "status"),
         packages=pick_all(
-            packages,
-            "name",
-            "shortname",
-            "installed_version",
-            "latest_version",
-            "update_available",
+            packages, "name", "shortname", "installed_version", "latest_version", 
+            "update_available"
         ),
     )
 
@@ -219,46 +188,13 @@ async def get_pfsense_interfaces() -> pfSenseInterfaces:
 
     return pfSenseInterfaces(
         interfaces=pick_all(
-            interfaces,
-            "id",
-            "if",
-            "enable",
-            "descr",
-            "mtu",
-            "mss",
-            "blockpriv",
-            "blockbogons",
-            "typev4",
-            "ipaddr",
-            "subnet",
-            "gateway",
-            "typev6",
-            "ipaddrv6",
-            "subnetv6",
-            "gatewayv6",
+            interfaces, "id", "if", "enable", "descr", "mtu", "mss", "blockpriv", "blockbogons", 
+            "typev4", "ipaddr", "subnet", "gateway", "typev6", "ipaddrv6", "subnetv6", "gatewayv6"
         ),
         status=pick_all(
-            status,
-            "name",
-            "descr",
-            "hwif",
-            "macaddr",
-            "mtu",
-            "status",
-            "ipaddr",
-            "subnet",
-            "ipaddrv6",
-            "subnetv6",
-            "inerrs",
-            "outerrs",
-            "collisions",
-            "inbytes",
-            "outbytes",
-            "inpkts",
-            "outpkts",
-            "media",
-            "gateway",
-            "gatewayv6",
+            status, "name", "descr", "hwif", "macaddr", "mtu", "status", "ipaddr", "subnet", 
+            "ipaddrv6", "subnetv6", "inerrs", "outerrs", "collisions", "inbytes", "outbytes", 
+            "inpkts", "outpkts", "media", "gateway", "gatewayv6"
         ),
         vlans=vlans,
         groups=groups,
@@ -278,41 +214,15 @@ async def get_pfsense_routing() -> pfSenseRouting:
     return pfSenseRouting(
         default_gateway=default_gateway,
         gateways=pick_all(
-            gateways,
-            "name",
-            "descr",
-            "disabled",
-            "ipprotocol",
-            "interface",
-            "gateway",
-            "monitor_disable",
-            "monitor",
-            "force_down",
-            "weight",
-            "latencylow",
-            "latencyhigh",
-            "losslow",
-            "losshigh",
+            gateways, "name", "descr", "disabled", "ipprotocol", "interface", 
+            "gateway", "monitor_disable", "monitor", "force_down", "weight", "latencylow", 
+            "latencyhigh", "losslow", "losshigh"
         ),
         status=pick_all(
-            status,
-            "name",
-            "srcip",
-            "monitorip",
-            "delay",
-            "stddev",
-            "loss",
-            "status",
-            "substatus",
+            status, "name", "srcip", "monitorip", "delay", "stddev", "loss", "status", "substatus"
         ),
         gateway_groups=gateway_groups,
-        static_routes=pick_all(
-            static_routes,
-            "network",
-            "gateway",
-            "descr",
-            "disabled",
-        ),
+        static_routes=pick_all(static_routes, "network", "gateway", "descr", "disabled"),
     )
 
 
@@ -329,75 +239,26 @@ async def get_pfsense_firewall() -> pfSenseFirewall:
 
     return pfSenseFirewall(
         rules=pick_all(
-            rules,
-            "type",
-            "interface",
-            "ipprotocol",
-            "protocol",
-            "icmptype",
-            "source",
-            "source_port",
-            "destination",
-            "destination_port",
-            "descr",
-            "disabled",
-            "log",
-            "statetype",
-            "floating",
-            "quick",
-            "direction",
-            "gateway",
-            "associated_rule_id",
+            rules, "type", "interface", "ipprotocol", "protocol", "icmptype", "source", 
+            "source_port", "destination", "destination_port", "descr", "disabled", "log", 
+            "statetype", "floating", "quick", "direction", "gateway", "associated_rule_id"
         ),
-        aliases=pick_all(
-            aliases,
-            "name",
-            "type",
-            "descr",
-            "address",
-        ),
+        aliases=pick_all(aliases, "name", "type", "descr", "address"),
         port_forwards=pick_all(
-            port_forwards,
-            "interface",
-            "ipprotocol",
-            "protocol",
-            "source",
-            "source_port",
-            "destination",
-            "destination_port",
-            "target",
-            "local_port",
-            "disabled",
-            "descr",
-            "natreflection",
+            port_forwards, "interface", "ipprotocol", "protocol", "source", "source_port", 
+            "destination", "destination_port", "target", "local_port", "disabled", "descr", 
+            "natreflection"
         ),
         outbound_nat_mode=outbound_nat_mode,
         outbound_nat=pick_all(
-            outbound_nat,
-            "interface",
-            "protocol",
-            "disabled",
-            "nonat",
-            "source",
-            "source_port",
-            "destination",
-            "destination_port",
-            "target",
-            "target_subnet",
-            "nat_port",
-            "static_nat_port",
-            "descr",
+            outbound_nat, "interface", "protocol", "disabled", "nonat", "source", "source_port", 
+            "destination", "destination_port", "target", "target_subnet", "nat_port", 
+            "static_nat_port", "descr"
         ),
         one_to_one_nat=one_to_one_nat,
         virtual_ips=pick_all(
-            virtual_ips,
-            "mode",
-            "interface",
-            "type",
-            "subnet",
-            "subnet_bits",
-            "descr",
-            "carp_status",
+            virtual_ips, "mode", "interface", "type", "subnet", "subnet_bits", "descr", 
+            "carp_status"
         ),
         state_table_size=state_table_size,
     )
@@ -410,25 +271,12 @@ async def get_pfsense_clients() -> pfSenseClients:
 
     return pfSenseClients(
         arp_table=pick_all(
-            arp_table,
-            "ip_address",
-            "mac_address",
-            "interface",
-            "permanent",
-            "dnsresolve",
-            "expires",
+            arp_table, "ip_address", "mac_address", "interface", "permanent", "dnsresolve", 
+            "expires"
         ),
         dhcp_leases=pick_all(
-            dhcp_leases,
-            "ip",
-            "mac",
-            "hostname",
-            "if",
-            "starts",
-            "ends",
-            "active_status",
-            "online_status",
-            "descr",
+            dhcp_leases, "ip", "mac", "hostname", "if", "starts", "ends", "active_status", 
+            "online_status", "descr"
         ),
     )
 
@@ -458,84 +306,34 @@ async def get_pfsense_network_services() -> pfSenseNetworkServices:
         )
 
         static_mappings[interface] = pick_all(
-            mappings,
-            "parent_id",
-            "mac",
-            "ipaddr",
-            "hostname",
-            "domain",
-            "descr",
-            "arp_table_static_entry",
+            mappings, "parent_id", "mac", "ipaddr", "hostname", "domain", "descr", 
+            "arp_table_static_entry"
         )
 
         address_pools[interface] = pick_all(
-            pools,
-            "parent_id",
-            "range_from",
-            "range_to",
-            "gateway",
-            "domain",
-            "dnsserver",
-            "ntpserver",
-            "descr",
+            pools, "parent_id", "range_from", "range_to", "gateway", "domain", "dnsserver", 
+            "ntpserver", "descr"
         )
 
     return pfSenseNetworkServices(
         dhcp_servers=pick_all(
-            dhcp_servers,
-            "id",
-            "interface",
-            "enable",
-            "range_from",
-            "range_to",
-            "gateway",
-            "domain",
-            "dnsserver",
-            "ntpserver",
-            "defaultleasetime",
-            "maxleasetime",
-            "denyunknown",
+            dhcp_servers, "id", "interface", "enable", "range_from", "range_to", "gateway", 
+            "domain", "dnsserver", "ntpserver", "defaultleasetime", "maxleasetime", "denyunknown"
         ),
         dhcp_static_mappings=static_mappings,
         dhcp_address_pools=address_pools,
         dns_resolver=pick(
-            dns_resolver,
-            "enable",
-            "port",
-            "enablessl",
-            "active_interface",
-            "outgoing_interface",
-            "strictout",
-            "system_domain_local_zone_type",
-            "dnssec",
-            "forwarding",
-            "regdhcp",
-            "regdhcpstatic",
-            "regovpnclients",
-            "custom_options",
+            dns_resolver, "enable", "port", "enablessl", "active_interface", "outgoing_interface", 
+            "strictout", "system_domain_local_zone_type", "dnssec", "forwarding", "regdhcp", 
+            "regdhcpstatic", "regovpnclients", "custom_options"
         ),
         dns_host_overrides=pick_all(
-            dns_host_overrides,
-            "host",
-            "domain",
-            "ip",
-            "descr",
-            "aliases",
+            dns_host_overrides, "host", "domain", "ip", "descr", "aliases"
         ),
         dns_domain_overrides=pick_all(
-            dns_domain_overrides,
-            "domain",
-            "ip",
-            "descr",
-            "tls_queries",
-            "tls_hostname",
+            dns_domain_overrides, "domain", "ip", "descr", "tls_queries", "tls_hostname"
         ),
-        system_dns=pick(
-            system_dns,
-            "dnsallowoverride",
-            "dnslocalhost",
-            "dnsserver",
-        ),
+        system_dns=pick(system_dns, "dnsallowoverride", "dnslocalhost", "dnsserver"),
     )
 
 
@@ -553,27 +351,12 @@ async def get_pfsense_vpn_status() -> pfSenseVPNStatus:
 
     return pfSenseVPNStatus(
         wireguard_tunnels=pick_all(
-            wireguard_tunnels,
-            "name",
-            "status",
-            "listen_port",
-            "mtu",
-            "transfer_rx",
-            "transfer_tx",
-            "inpkts",
-            "outpkts",
-            "descr",
+            wireguard_tunnels, "name", "status", "listen_port", "mtu", "transfer_rx", 
+            "transfer_tx", "inpkts", "outpkts", "descr"
         ),
         wireguard_peers=pick_all(
-            wireguard_peers,
-            "tunnel_device",
-            "endpoint",
-            "allowed_ips",
-            "latest_handshake",
-            "transfer_rx",
-            "transfer_tx",
-            "persistent_keepalive",
-            "descr",
+            wireguard_peers, "tunnel_device", "endpoint", "allowed_ips", "latest_handshake", 
+            "transfer_rx", "transfer_tx", "persistent_keepalive", "descr"
         ),
         openvpn_servers=openvpn_servers,
         openvpn_clients=openvpn_clients,
