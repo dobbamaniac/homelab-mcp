@@ -106,21 +106,6 @@ class DockerComposeProjects:
 
 
 @dataclass(frozen=True)
-class DockerContainerStats:
-    host: str
-    name: str
-    cpu_usage_ratio: float
-    memory_used_bytes: int
-    memory_limit_bytes: int | None
-    memory_usage_ratio: float | None
-    network_rx_bytes: int
-    network_tx_bytes: int
-    block_read_bytes: int
-    block_write_bytes: int
-    pids: int
-
-
-@dataclass(frozen=True)
 class DockerLogChunk:
     stream: str
     output: str
@@ -612,71 +597,6 @@ async def list_docker_compose_projects(host: str | None = None) -> DockerCompose
     return DockerComposeProjects(projects=projects)
 
 
-async def get_docker_container_stats(
-    host: str,
-    container: str,
-) -> DockerContainerStats:
-    """Get one non-streaming runtime resource snapshot for a running Docker container."""
-    container, inspect = await _inspect_container(host, container)
-    state = inspect.get("State") or {}
-
-    if not state.get("Running"):
-        raise RuntimeError(f"Docker container {container!r} on host {host!r} is not running")
-
-    data = await _get(
-        host,
-        f"containers/{container}/stats",
-        params={"stream": "false"},
-    )
-
-    memory = data.get("memory_stats") or {}
-    memory_used = _memory_used(memory)
-    memory_limit = int(memory.get("limit", 0))
-    networks = data.get("networks") or {}
-
-    block_read = 0
-    block_write = 0
-
-    for item in (
-        (data.get("blkio_stats") or {}).get("io_service_bytes_recursive")
-        or []
-    ):
-        operation = str(item.get("op", "")).lower()
-        value = int(item.get("value", 0))
-
-        if operation.startswith("r"):
-            block_read += value
-
-        elif operation.startswith("w"):
-            block_write += value
-
-    return DockerContainerStats(
-        host=host,
-        name=str(inspect.get("Name", container)).removeprefix("/"),
-        cpu_usage_ratio=_cpu_usage_ratio(data),
-        memory_used_bytes=memory_used,
-        memory_limit_bytes=memory_limit,
-        memory_usage_ratio=(
-            memory_used / memory_limit
-            if memory_limit
-            else 0.0
-        ),
-        network_rx_bytes=sum(
-            int(network.get("rx_bytes", 0))
-            for network in networks.values()
-        ),
-        network_tx_bytes=sum(
-            int(network.get("tx_bytes", 0))
-            for network in networks.values()
-        ),
-        block_read_bytes=block_read,
-        block_write_bytes=block_write,
-        pids=int(
-            (data.get("pids_stats") or {}).get("current", 0)
-        ),
-    )
-
-
 async def get_docker_container_logs(
     host: str,
     container: str,
@@ -777,7 +697,6 @@ TOOLS = (
     list_docker_containers,
     get_docker_container,
     list_docker_compose_projects,
-    get_docker_container_stats,
     get_docker_container_logs,
     get_docker_container_health,
 )
