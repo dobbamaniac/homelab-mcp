@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import posixpath
 import re
 from collections.abc import AsyncIterator, Iterator
@@ -33,8 +32,6 @@ UnitType = Literal[
 
 UnitState = Literal["active", "inactive", "failed", "all"]
 
-JournalPriority = Literal["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
-
 UnitRef = Annotated[
     str,
     Field(
@@ -60,24 +57,11 @@ class LinuxHost:
     kernel_version: str
     architecture: str
     virtualization: str | None
-    uptime_seconds: int
 
 
 @dataclass(frozen=True)
 class LinuxHosts:
     hosts: list[LinuxHost]
-
-
-@dataclass(frozen=True)
-class LinuxStatus:
-    host: str
-    cpu_count: int
-    load_average: list[float]
-    memory_total_bytes: int
-    memory_available_bytes: int
-    swap_total_bytes: int
-    swap_used_bytes: int
-    uptime_seconds: int
 
 
 @dataclass(frozen=True)
@@ -204,22 +188,6 @@ class LinuxUnitFiles:
 
 
 @dataclass(frozen=True)
-class LinuxJournalEntry:
-    timestamp_us: int
-    priority: str | None
-    unit: str | None
-    identifier: str | None
-    pid: int | None
-    message: str
-
-
-@dataclass(frozen=True)
-class LinuxJournal:
-    host: str
-    entries: list[LinuxJournalEntry]
-
-
-@dataclass(frozen=True)
 class LinuxSysctl:
     key: str
     value: str
@@ -262,8 +230,6 @@ _PSEUDO_FILESYSTEMS = {
 }
 
 _DOCKER_BRIDGE = re.compile(r"br-[0-9a-f]{12}")
-
-_JOURNAL_PRIORITIES = ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")
 
 _MAX_FILE_BYTES = 128 * 1024
 
@@ -367,11 +333,10 @@ def _virtual_interface(name: str) -> bool:
 
 
 async def _get_linux_host(name: str) -> LinuxHost:
-    info, architecture, virtualization, uptime = await asyncio.gather(
+    info, architecture, virtualization = await asyncio.gather(
         _run_json(name, "hostnamectl", "--json=short", "status"),
-        _run( name, "uname", "-m"),
-        _run( name, "systemd-detect-virt", check=False),
-        _run( name, "cat", "/proc/uptime"),
+        _run(name, "uname", "-m"),
+        _run(name, "systemd-detect-virt", check=False),
     )
 
     if not isinstance(info, dict):
@@ -390,7 +355,6 @@ async def _get_linux_host(name: str) -> LinuxHost:
             if virtualization and virtualization != "none"
             else None
         ),
-        uptime_seconds=int(float(uptime.split()[0])),
     )
 
 
@@ -402,34 +366,6 @@ async def list_linux_hosts() -> LinuxHosts:
     ))
 
     return LinuxHosts(hosts=list(hosts))
-
-
-async def get_linux_status(host: str) -> LinuxStatus:
-    """Get current CPU, memory, swap, load, and uptime status for a Linux host."""
-    cpu, load, raw_memory, uptime = await asyncio.gather(
-        _run(host, "getconf", "_NPROCESSORS_ONLN"),
-        _run(host, "cat", "/proc/loadavg"),
-        _run(host, "cat", "/proc/meminfo"),
-        _run(host, "cat", "/proc/uptime"),
-    )
-
-    memory = _meminfo(raw_memory)
-    swap_total = memory.get("SwapTotal", 0)
-    swap_free = memory.get("SwapFree", 0)
-
-    return LinuxStatus(
-        host=host,
-        cpu_count=int(cpu.strip()),
-        load_average=[
-            float(value)
-            for value in load.split()[:3]
-        ],
-        memory_total_bytes=memory.get("MemTotal", 0),
-        memory_available_bytes=memory.get("MemAvailable", 0),
-        swap_total_bytes=swap_total,
-        swap_used_bytes=max(swap_total - swap_free, 0),
-        uptime_seconds=int(float(uptime.split()[0])),
-    )
 
 
 async def get_linux_storage(host: str) -> LinuxStorage:
@@ -799,91 +735,6 @@ async def get_linux_unit_files(
     )
 
 
-async def get_linux_journal(
-    host: str,
-    unit: UnitRef | None = None,
-    priority: JournalPriority | None = None,
-    since_seconds: Annotated[int, Field(ge=1, le=604800)] = 3600,
-    limit: Annotated[int, Field(ge=1, le=1000)] = 200,
-) -> LinuxJournal:
-    """
-    Get recent systemd journal entries from a Linux host.
-
-    Optionally filters by systemd unit and priority. Results are bounded by time and entry count.
-    """
-    command = [
-        "journalctl", "--quiet", "--no-pager", "--output=json", 
-        "--output-fields=" "PRIORITY,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_PID,MESSAGE", 
-        f"--since=-{since_seconds}s", f"--lines={limit}"
-    ]
-
-    if unit is not None:
-        command.append(f"--unit={unit}")
-
-    if priority is not None:
-        command.append(f"--priority={priority}")
-
-    output = await _run(host, *command)
-    entries: list[LinuxJournalEntry] = []
-
-    for line in output.splitlines():
-        if not line:
-            continue
-
-        try:
-            item = json.loads(line)
-
-        except json.JSONDecodeError as exc:
-            raise LinuxRequestError(
-                f"Linux host {host!r} returned invalid journal JSON"
-            ) from exc
-
-        if not isinstance(item, dict):
-            continue
-
-        raw_priority = item.get("PRIORITY")
-        priority_number = (
-            int(raw_priority)
-            if str(raw_priority).isdigit()
-            else -1
-        )
-
-        raw_pid = item.get("_PID")
-
-        entries.append(
-            LinuxJournalEntry(
-                timestamp_us=int(item.get("__REALTIME_TIMESTAMP") or 0),
-                priority=(
-                    _JOURNAL_PRIORITIES[priority_number]
-                    if 0 <= priority_number
-                    < len(_JOURNAL_PRIORITIES)
-                    else None
-                ),
-                unit=(
-                    str(item["_SYSTEMD_UNIT"])
-                    if item.get("_SYSTEMD_UNIT")
-                    else None
-                ),
-                identifier=(
-                    str(item["SYSLOG_IDENTIFIER"])
-                    if item.get("SYSLOG_IDENTIFIER")
-                    else None
-                ),
-                pid=(
-                    int(raw_pid)
-                    if str(raw_pid).isdigit()
-                    else None
-                ),
-                message=redact_text(str(item.get("MESSAGE") or "")),
-            )
-        )
-
-    return LinuxJournal(
-        host=host,
-        entries=entries,
-    )
-
-
 async def get_linux_sysctls(
     host: str,
     prefix: SysctlPrefix,
@@ -1004,14 +855,12 @@ async def read_linux_file(
 
 TOOLS = (
     list_linux_hosts,
-    get_linux_status,
     get_linux_storage,
     get_linux_network,
     list_linux_packages,
     list_linux_units,
     get_linux_unit,
     get_linux_unit_files,
-    get_linux_journal,
     get_linux_sysctls,
     read_linux_file,
 )

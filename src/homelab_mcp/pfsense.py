@@ -4,10 +4,9 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Any
 
 import httpx
-from pydantic import Field
 
 from homelab_mcp.http import get_json
 from homelab_mcp.utils import pick, pick_all, require_env
@@ -16,9 +15,6 @@ from homelab_mcp.utils import pick, pick_all, require_env
 # -------------------------------------------------------------------------------------------------
 # Structured output
 # -------------------------------------------------------------------------------------------------
-
-
-LogKind = Literal["firewall", "dhcp", "system", "auth", "openvpn", "restapi"]
 
 
 @dataclass(frozen=True)
@@ -88,26 +84,12 @@ class pfSenseVPNStatus:
     ipsec_child_sas: list[dict[str, Any]]
 
 
-@dataclass(frozen=True)
-class pfSenseLogs:
-    log: LogKind
-    entries: list[str]
-
-
 # -------------------------------------------------------------------------------------------------
 # Internal API helpers
 # -------------------------------------------------------------------------------------------------
 
 
 _client: httpx.AsyncClient | None = None
-_LOG_PATHS: dict[LogKind, str] = {
-    "firewall": "status/logs/firewall",
-    "dhcp": "status/logs/dhcp",
-    "system": "status/logs/system",
-    "auth": "status/logs/auth",
-    "openvpn": "status/logs/openvpn",
-    "restapi": "status/logs/packages/restapi",
-}
 
 
 @asynccontextmanager
@@ -158,7 +140,7 @@ async def _get(
 
 
 async def get_pfsense_system() -> pfSenseSystem:
-    """Get pfSense system, version, service, and installed-package status."""
+    """Get pfSense platform, version, service, and installed-package information."""
     status, version, services, packages = await asyncio.gather(
         _get("status/system"),
         _get("system/version"),
@@ -168,9 +150,8 @@ async def get_pfsense_system() -> pfSenseSystem:
 
     return pfSenseSystem(
         status=pick(
-            status, "platform", "uptime", "bios_vendor", "bios_version", "bios_date", "kernel_pti", 
-            "mds_mitigation", "temp_c", "cpu_model", "cpu_load_avg", "cpu_count", "cpu_usage", 
-            "mbuf_usage", "mem_usage", "swap_usage", "disk_usage"
+            status, "platform", "bios_vendor", "bios_version", "bios_date", "kernel_pti", 
+            "mds_mitigation", "cpu_model", "cpu_count",  
         ),
         version=version,
         services=pick_all(services, "name", "description", "enabled", "status"),
@@ -199,8 +180,7 @@ async def get_pfsense_interfaces() -> pfSenseInterfaces:
         ),
         status=pick_all(
             status, "name", "descr", "hwif", "macaddr", "mtu", "status", "ipaddr", "subnet", 
-            "ipaddrv6", "subnetv6", "inerrs", "outerrs", "collisions", "inbytes", "outbytes", 
-            "inpkts", "outpkts", "media", "gateway", "gatewayv6"
+            "ipaddrv6", "subnetv6", "media", "gateway", "gatewayv6"
         ),
         vlans=vlans,
         groups=groups,
@@ -375,12 +355,11 @@ async def get_pfsense_vpn_status() -> pfSenseVPNStatus:
 
     return pfSenseVPNStatus(
         wireguard_tunnels=pick_all(
-            wireguard_tunnels, "name", "status", "listen_port", "mtu", "transfer_rx", 
-            "transfer_tx", "inpkts", "outpkts", "descr"
+            wireguard_tunnels, "name", "status", "listen_port", "mtu", "descr"
         ),
         wireguard_peers=pick_all(
             wireguard_peers, "tunnel_device", "endpoint", "allowed_ips", "latest_handshake", 
-            "transfer_rx", "transfer_tx", "persistent_keepalive", "descr"
+            "persistent_keepalive", "descr"
         ),
         openvpn_servers=openvpn_servers,
         openvpn_clients=openvpn_clients,
@@ -390,24 +369,6 @@ async def get_pfsense_vpn_status() -> pfSenseVPNStatus:
     )
 
 
-async def get_pfsense_logs(
-    log: LogKind,
-    limit: Annotated[int, Field(ge=1, le=200)] = 50,
-) -> pfSenseLogs:
-    """Get recent entries from one pfSense diagnostic log."""
-    entries = await _get(
-        _LOG_PATHS[log],
-        params={
-            "limit": str(limit),
-            "reverse": "true",
-        },
-    )
-
-    return pfSenseLogs(
-        log=log,
-        entries=[entry["text"] for entry in entries],
-    )
-
 TOOLS = (
     get_pfsense_system,
     get_pfsense_interfaces,
@@ -416,5 +377,4 @@ TOOLS = (
     get_pfsense_clients,
     get_pfsense_network_services,
     get_pfsense_vpn_status,
-    get_pfsense_logs,
 )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -12,7 +11,6 @@ import httpx
 from pydantic import Field
 
 from homelab_mcp.http import (
-    RequestError as DockerRequestError,
     get as http_get,
     json_data,
 )
@@ -106,20 +104,6 @@ class DockerComposeProjects:
 
 
 @dataclass(frozen=True)
-class DockerLogChunk:
-    stream: str
-    output: str
-
-
-@dataclass(frozen=True)
-class DockerContainerLogs:
-    host: str
-    name: str
-    tty: bool
-    chunks: list[DockerLogChunk]
-
-
-@dataclass(frozen=True)
 class DockerHealthLogEntry:
     start: str
     end: str
@@ -145,7 +129,6 @@ class DockerContainerHealth:
 _clients: dict[str, httpx.AsyncClient] = {}
 _versions: dict[str, dict[str, Any]] = {}
 _CONTAINER_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-_MAX_LOG_BYTES = 512 * 1024
 
 
 def _configured_hosts() -> dict[str, str]:
@@ -307,62 +290,13 @@ def _cpu_usage_ratio(stats: dict[str, Any]) -> float:
     return cpu_delta / system_delta * cpu_count
 
 
-def _docker_log_chunks(
-    data: bytes,
-    *,
-    tty: bool,
-) -> list[DockerLogChunk]:
-    if len(data) > _MAX_LOG_BYTES:
-        raise DockerRequestError("Docker container log response exceeded maximum size")
-
-    if tty:
-        return [
-            DockerLogChunk(
-                stream="combined",
-                output=redact_text(data.decode(errors="replace")),
-            )
-        ] if data else []
-
-    chunks: list[DockerLogChunk] = []
-    offset = 0
-
-    stream_names = {0: "stdin", 1: "stdout", 2: "stderr"}
-
-    while offset < len(data):
-        if len(data) - offset < 8:
-            raise DockerRequestError("Docker returned a truncated log stream header")
-
-        stream_type = data[offset]
-        size = int.from_bytes(
-            data[offset + 4:offset + 8],
-            byteorder="big",
-        )
-        offset += 8
-
-        end = offset + size
-
-        if end > len(data):
-            raise DockerRequestError("Docker returned a truncated log stream payload")
-
-        payload = data[offset:end]
-        offset = end
-
-        chunks.append(
-            DockerLogChunk(
-                stream=stream_names.get(stream_type, "unknown"),
-                output=redact_text(payload.decode(errors="replace")),
-            )
-        )
-
-    return chunks
-
 # -------------------------------------------------------------------------------------------------
 # MCP tools
 # -------------------------------------------------------------------------------------------------
 
 
 async def list_docker_hosts() -> DockerHosts:
-    """List configured Docker hosts and their current Engine/resource status."""
+    """List configured Docker hosts and compact Engine/inventory information."""
     hosts: list[DockerHost] = []
 
     for name in sorted(_clients):
@@ -597,45 +531,6 @@ async def list_docker_compose_projects(host: str | None = None) -> DockerCompose
     return DockerComposeProjects(projects=projects)
 
 
-async def get_docker_container_logs(
-    host: str,
-    container: str,
-    tail: Annotated[int, Field(ge=1, le=1000)] = 200,
-    since_seconds: Annotated[int, Field(ge=1, le=604800)] | None = None,
-) -> DockerContainerLogs:
-    """
-    Get recent stdout/stderr logs for a Docker container.
-
-    `tail` is limited to 1-1000 lines. `since_seconds`, when provided,
-    restricts output to approximately that many seconds of recent logs.
-    """
-    container, inspect = await _inspect_container(host, container)
-
-    config = inspect.get("Config") or {}
-    tty = bool(config.get("Tty", False))
-
-    params = {"stdout": "true", "stderr": "true", "timestamps": "true", "tail": str(tail)}
-
-    if since_seconds is not None:
-        params["since"] = str(max(int(time.time()) - since_seconds, 0))
-
-    response = await _get_response(
-        host,
-        f"containers/{container}/logs",
-        params=params,
-    )
-
-    return DockerContainerLogs(
-        host=host,
-        name=str(inspect.get("Name", container)).removeprefix("/"),
-        tty=tty,
-        chunks=_docker_log_chunks(
-            response.content,
-            tty=tty,
-        ),
-    )
-
-
 async def get_docker_container_health(
     host: str,
     container: str,
@@ -697,6 +592,5 @@ TOOLS = (
     list_docker_containers,
     get_docker_container,
     list_docker_compose_projects,
-    get_docker_container_logs,
     get_docker_container_health,
 )

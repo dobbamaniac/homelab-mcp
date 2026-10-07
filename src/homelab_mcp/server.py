@@ -49,7 +49,13 @@ async def lifespan(_: MCPServer) -> AsyncIterator[None]:
 def create_server() -> MCPServer:
     mcp = MCPServer(
         "Homelab",
-        instructions="Read-only tools for inspecting homelab infrastructure.",
+        instructions=(
+            "Read-only tools for homelab inventory, configuration, topology, "
+            "and direct state inspection. Use Grafana for metrics, resource "
+            "utilization, historical health, alert state, and logs when those "
+            "data are available there. Prefer inventory tools to discover "
+            "identifiers before calling detail tools."
+        ),
         lifespan=lifespan,
     )
 

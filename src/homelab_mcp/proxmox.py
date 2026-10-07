@@ -25,23 +25,13 @@ GuestKind = Literal["qemu", "lxc"]
 class ProxmoxNode:
     name: str
     status: str
-    uptime_seconds: int
-    cpu_usage_ratio: float
     cpu_count: int
-    memory_used_bytes: int
     memory_total_bytes: int
 
 
 @dataclass(frozen=True)
 class ProxmoxNodes:
     nodes: list[ProxmoxNode]
-
-
-@dataclass(frozen=True)
-class ProxmoxNodeStatus:
-    node: str
-    status: dict[str, Any]
-    version: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -57,10 +47,7 @@ class ProxmoxGuest:
     kind: GuestKind
     node: str
     status: str
-    uptime_seconds: int
-    cpu_usage_ratio: float
     cpu_count: int
-    memory_used_bytes: int
     memory_total_bytes: int
     template: bool
 
@@ -321,21 +308,14 @@ def _drop(
 
 
 async def list_proxmox_nodes() -> ProxmoxNodes:
-    """
-    List Proxmox VE nodes and their current resource utilization.
-
-    Returns structured, read-only status information from the configured Proxmox VE API.
-    """
+    """List Proxmox VE nodes and compact inventory information."""
     data = await _get("nodes")
 
     nodes = [
         ProxmoxNode(
             name=str(item["node"]),
             status=str(item.get("status", "unknown")),
-            uptime_seconds=int(item.get("uptime", 0)),
-            cpu_usage_ratio=float(item.get("cpu", 0.0)),
             cpu_count=int(item.get("maxcpu", 0)),
-            memory_used_bytes=int(item.get("mem", 0)),
             memory_total_bytes=int(item.get("maxmem", 0)),
         ) for item in data
     ]
@@ -349,8 +329,8 @@ async def list_proxmox_guests() -> ProxmoxGuests:
     """
     List Proxmox VE virtual machines and LXC containers.
 
-    Returns structured, read-only status and resource utilization from the configured Proxmox VE 
-    API.
+    Returns identifiers, placement, configured resources, and current
+    lifecycle state for guest discovery and subsequent inspection.
     """
     data = await _get("cluster/resources", params={"type": "vm"})
 
@@ -369,10 +349,7 @@ async def list_proxmox_guests() -> ProxmoxGuests:
                 kind=cast(GuestKind, raw_kind),
                 node=str(item.get("node", "")),
                 status=str(item.get("status", "unknown")),
-                uptime_seconds=int(item.get("uptime", 0)),
-                cpu_usage_ratio=float(item.get("cpu", 0.0)),
                 cpu_count=int(item.get("maxcpu", 0)),
-                memory_used_bytes=int(item.get("mem", 0)),
                 memory_total_bytes=int(item.get("maxmem", 0)),
                 template=bool(item.get("template", 0)),
             )
@@ -463,36 +440,6 @@ async def get_proxmox_node_network(node: str) -> ProxmoxNodeNetwork:
     return ProxmoxNodeNetwork(
         node=node,
         interfaces=interfaces,
-    )
-
-
-async def get_proxmox_node_status(node: str) -> ProxmoxNodeStatus:
-    """
-    Get detailed runtime and system status for one Proxmox VE node.
-
-    Includes the status information exposed by Proxmox for CPU, memory, swap, load, uptime, kernel,
-    PVE version, and related host metrics.
-    """
-    status, version = await asyncio.gather(
-        _get(f"nodes/{node}/status"),
-        _get(f"nodes/{node}/version"),
-    )
-
-    status = pick(
-        status, "cpu", "uptime", "loadavg", "memory", "swap", "rootfs", "ksm", "boot-info", 
-        "current-kernel", "cpuinfo"
-    )
-
-    status["cpuinfo"] = pick(
-        status.get("cpuinfo") or {}, "model", "vendor", "sockets", "cores", "cpus", "mhz", "hvm"
-    )
-
-    version = pick(version, "version", "repoid")
-
-    return ProxmoxNodeStatus(
-        node=node,
-        status=status,
-        version=version,
     )
 
 
@@ -976,7 +923,6 @@ TOOLS = (
     get_proxmox_guest_config,
     list_proxmox_storage,
     get_proxmox_node_network,
-    get_proxmox_node_status,
     get_proxmox_storage_health,
     get_proxmox_backup_status,
     get_proxmox_firewall,
