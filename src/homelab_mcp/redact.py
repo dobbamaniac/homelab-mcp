@@ -19,7 +19,9 @@ _SENSITIVE_SUFFIXES = (
 
 _SENSITIVE_KEYS = {
     "aws_secret_access_key",
+    "cipassword",
     "secret_access_key",
+    "sshkeys",
 }
 
 _ASSIGNMENT_RE = re.compile(
@@ -118,3 +120,7 @@ def redact_mapping(value: dict[str, Any]) -> dict[str, Any]:
         )
         for key, item in value.items()
     }
+
+def redact_value(value: Any) -> Any:
+    """Recursively redact known secret-bearing keys and text patterns."""
+    return _redact(value)

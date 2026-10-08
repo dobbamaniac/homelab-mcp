@@ -50,11 +50,13 @@ def create_server() -> MCPServer:
     mcp = MCPServer(
         "Homelab",
         instructions=(
-            "Read-only tools for homelab inventory, configuration, topology, "
-            "and direct state inspection. Use Grafana for metrics, resource "
-            "utilization, historical health, alert state, and logs when those "
-            "data are available there. Prefer inventory tools to discover "
-            "identifiers before calling detail tools."
+            "Read-only adapters for homelab management APIs and host configuration. "
+            "Most tools map to one upstream GET endpoint or one read-only host command; "
+            "the exact upstream endpoint or command is named in each tool description. "
+            "Response field names stay close to the upstream API unless fields are "
+            "redacted or omitted for safety. Compose multiple tools when a question "
+            "requires multiple resources. Use Grafana for metrics, historical health, "
+            "alerts, and logs."
         ),
         lifespan=lifespan,
     )
