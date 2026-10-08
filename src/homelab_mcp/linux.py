@@ -1,29 +1,33 @@
 from __future__ import annotations
 
-import asyncio
 import posixpath
-import re
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
-from homelab_mcp.redact import redact_text
-from homelab_mcp.utils import require_env
+from homelab_mcp.redact import redact_text, redact_value
 from homelab_mcp.ssh import (
     RequestError as LinuxRequestError,
     host_names as _ssh_hosts,
     run as _run,
-    run_json as _run_json
+    run_json as _run_json,
 )
+from homelab_mcp.utils import pick, require_env
 
 
-# -------------------------------------------------------------------------------------------------
-# Structured output
-# -------------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Tool parameter types
+# ---------------------------------------------------------------------------
 
+HostRef = Annotated[
+    str,
+    Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+        description="Linux SSH host name returned by list_linux_hosts.",
+    ),
+]
 
 UnitType = Literal[
     "service", "socket", "timer", "target", "device", "mount", "automount", "swap", "path", 
@@ -39,188 +43,30 @@ UnitRef = Annotated[
             r"^[A-Za-z0-9][A-Za-z0-9_.@:-]*"
             r"\.(?:service|socket|timer|target|device|mount|automount|"
             r"swap|path|slice|scope)$"
-        )
+        ),
+        description="systemd unit name returned by list_linux_units or " "list_linux_unit_files.",
     ),
 ]
 
 SysctlPrefix = Annotated[
     str,
-    Field(pattern=r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$"),
+    Field(
+        pattern=r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$",
+        description='Dotted sysctl prefix such as "net.ipv4" or "vm".',
+    ),
+]
+
+LinuxFileRef = Annotated[
+    str,
+    Field(
+        description="Approved absolute path returned by list_linux_files.",
+    ),
 ]
 
 
-@dataclass(frozen=True)
-class LinuxHost:
-    name: str
-    hostname: str
-    operating_system: str
-    kernel_version: str
-    architecture: str
-    virtualization: str | None
-
-
-@dataclass(frozen=True)
-class LinuxHosts:
-    hosts: list[LinuxHost]
-
-
-@dataclass(frozen=True)
-class LinuxBlockDevice:
-    name: str
-    path: str
-    type: str
-    size_bytes: int
-    filesystem: str | None
-    mountpoints: list[str]
-
-
-@dataclass(frozen=True)
-class LinuxFilesystem:
-    source: str
-    target: str
-    filesystem: str
-    size_bytes: int
-    used_bytes: int
-    available_bytes: int
-    usage_ratio: float
-    read_only: bool
-
-
-@dataclass(frozen=True)
-class LinuxStorage:
-    host: str
-    block_devices: list[LinuxBlockDevice]
-    filesystems: list[LinuxFilesystem]
-
-
-@dataclass(frozen=True)
-class LinuxInterface:
-    name: str
-    state: str
-    mtu: int
-    mac_address: str | None
-    addresses: list[str]
-
-
-@dataclass(frozen=True)
-class LinuxRoute:
-    destination: str
-    gateway: str | None
-    device: str | None
-    source: str | None
-    metric: int | None
-
-
-@dataclass(frozen=True)
-class LinuxListener:
-    protocol: str
-    address: str
-    port: int
-
-
-@dataclass(frozen=True)
-class LinuxNetwork:
-    host: str
-    interfaces: list[LinuxInterface]
-    routes: list[LinuxRoute]
-    dns_servers: list[str]
-    listeners: list[LinuxListener]
-
-
-@dataclass(frozen=True)
-class LinuxPackage:
-    name: str
-    version: str
-    architecture: str
-    automatic: bool
-    held: bool
-    synopsis: str
-
-
-@dataclass(frozen=True)
-class LinuxPackages:
-    host: str
-    packages: list[LinuxPackage]
-
-
-@dataclass(frozen=True)
-class LinuxUnit:
-    name: str
-    description: str
-    load_state: str
-    active_state: str
-    sub_state: str
-
-
-@dataclass(frozen=True)
-class LinuxUnits:
-    host: str
-    units: list[LinuxUnit]
-
-
-@dataclass(frozen=True)
-class LinuxUnitDetails:
-    host: str
-    name: str
-    description: str
-    load_state: str
-    active_state: str
-    sub_state: str
-    unit_file_state: str | None
-    unit_file_preset: str | None
-    fragment_path: str | None
-    source_path: str | None
-    drop_in_paths: list[str]
-    need_daemon_reload: bool
-
-
-@dataclass(frozen=True)
-class LinuxUnitFile:
-    name: str
-    state: str
-    preset: str | None
-
-
-@dataclass(frozen=True)
-class LinuxUnitFiles:
-    host: str
-    unit_files: list[LinuxUnitFile]
-
-
-@dataclass(frozen=True)
-class LinuxSysctl:
-    key: str
-    value: str
-
-
-@dataclass(frozen=True)
-class LinuxSysctls:
-    host: str
-    prefix: str
-    values: list[LinuxSysctl]
-
-
-@dataclass(frozen=True)
-class LinuxFile:
-    host: str
-    path: str
-    file_type: str
-    size_bytes: int
-    mode: str
-    uid: int
-    gid: int
-    owner: str
-    group: str
-    modified_at_epoch: int
-    content: str | None
-    redacted: bool
-    read_error: str | None
-
-
-# -------------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Internal helpers
-# -------------------------------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 
 _files: set[str] = set()
 
@@ -228,8 +74,6 @@ _PSEUDO_FILESYSTEMS = {
     "devtmpfs", "tmpfs", "proc", "sysfs", "cgroup", "cgroup2", "devpts", "securityfs", "debugfs", 
     "tracefs", "configfs", "pstore", "mqueue",
 }
-
-_DOCKER_BRIDGE = re.compile(r"br-[0-9a-f]{12}")
 
 _MAX_FILE_BYTES = 128 * 1024
 
@@ -244,9 +88,7 @@ def _configured_files() -> set[str]:
             raise RuntimeError("LINUX_FILES contains an empty entry")
 
         if not path.startswith("/") or posixpath.normpath(path) != path:
-            raise RuntimeError(
-                f"LINUX_FILES must contain normalized absolute paths, got {path!r}"
-            )
+            raise RuntimeError(f"LINUX_FILES must contain normalized absolute paths, got {path!r}")
 
         if path in files:
             raise RuntimeError(f"Duplicate Linux configuration path {path!r}")
@@ -258,7 +100,7 @@ def _configured_files() -> set[str]:
 
 @asynccontextmanager
 async def session() -> AsyncIterator[None]:
-    """Validate Linux SSH configuration for the server lifetime."""
+    """Validate Linux configuration for the server lifetime."""
     if _files:
         raise RuntimeError("Linux configuration is already initialized")
 
@@ -271,40 +113,12 @@ async def session() -> AsyncIterator[None]:
         _files.clear()
 
 
-def _meminfo(value: str) -> dict[str, int]:
-    memory: dict[str, int] = {}
-
-    for line in value.splitlines():
-        if ":" not in line:
-            continue
-
-        key, raw = line.split(":", 1)
-        fields = raw.split()
-
-        if fields:
-            memory[key] = int(fields[0]) * 1024
-
-    return memory
-
-
 def _flatten(
     items: list[dict[str, Any]],
 ) -> Iterator[dict[str, Any]]:
     for item in items:
         yield item
         yield from _flatten(item.get("children") or [])
-
-
-def _dns_servers(value: str) -> list[str]:
-    servers = []
-
-    for line in value.splitlines():
-        fields = line.split()
-
-        if len(fields) >= 2 and fields[0] == "nameserver":
-            servers.append(fields[1])
-
-    return sorted(set(servers))
 
 
 def _endpoint(value: str) -> tuple[str, int]:
@@ -319,187 +133,220 @@ def _endpoint(value: str) -> tuple[str, int]:
     )
 
 
-def _virtual_interface(name: str) -> bool:
-    return (
-        name == "docker0"
-        or name.startswith("veth")
-        or bool(_DOCKER_BRIDGE.fullmatch(name))
+# ---------------------------------------------------------------------------
+# Host inventory
+# ---------------------------------------------------------------------------
+
+async def list_linux_hosts() -> dict[str, Any]:
+    """
+    List Linux host names configured for SSH access.
+
+    Source: server-side SSH_HOSTS configuration.
+
+    No SSH command is run.
+    """
+    return {"hosts": list(_ssh_hosts())}
+
+
+async def get_linux_host(
+    host: HostRef,
+) -> dict[str, Any]:
+    """
+    Get operating-system and hardware identity for one Linux host.
+
+    Upstream command:
+    hostnamectl --json=short status
+    """
+    data = await _run_json(
+        host,
+        "hostnamectl", "--json=short", "status",
     )
 
+    if not isinstance(data, dict):
+        raise LinuxRequestError(
+            f"Linux host {host!r} returned invalid hostname information"
+        )
 
-# -------------------------------------------------------------------------------------------------
-# MCP tools
-# -------------------------------------------------------------------------------------------------
-
-
-async def _get_linux_host(name: str) -> LinuxHost:
-    info, architecture, virtualization = await asyncio.gather(
-        _run_json(name, "hostnamectl", "--json=short", "status"),
-        _run(name, "uname", "-m"),
-        _run(name, "systemd-detect-virt", check=False),
-    )
-
-    if not isinstance(info, dict):
-        raise LinuxRequestError(f"Linux host {name!r} returned invalid hostname information")
-
-    virtualization = virtualization.strip()
-
-    return LinuxHost(
-        name=name,
-        hostname=str(info.get("Hostname", "")),
-        operating_system=str(info.get("OperatingSystemPrettyName", "")),
-        kernel_version=str(info.get("KernelRelease", "")),
-        architecture=architecture.strip(),
-        virtualization=(
-            virtualization
-            if virtualization and virtualization != "none"
-            else None
-        ),
-    )
-
-
-async def list_linux_hosts() -> LinuxHosts:
-    """List configured Linux hosts and compact operating-system information."""
-    hosts = await asyncio.gather(*(
-        _get_linux_host(name)
-        for name in _ssh_hosts()
+    return redact_value(pick(
+        data,
+        "Hostname", "OperatingSystemPrettyName", "KernelName", "KernelRelease", "Architecture", 
+        "Virtualization", "HardwareVendor", "HardwareModel", "FirmwareVersion"
     ))
 
-    return LinuxHosts(hosts=list(hosts))
 
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
 
-async def get_linux_storage(host: str) -> LinuxStorage:
-    """Get block-device and mounted-filesystem capacity for a Linux host."""
-    lsblk, findmnt = await asyncio.gather(
-        _run_json(
-            host, "lsblk", "--json", "--bytes", 
-            "--output", "NAME,PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS"
-        ),
-        _run_json(
-            host, "findmnt", "--json", "--bytes", "--df", 
-            "--output", "SOURCE,TARGET,FSTYPE,SIZE,USED,AVAIL,USE%,OPTIONS"
-        ),
+async def list_linux_block_devices(
+    host: HostRef,
+) -> dict[str, Any]:
+    """
+    List block devices on one Linux host.
+
+    Upstream command:
+    lsblk --json --bytes --output NAME,PATH,PKNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL
+    """
+    data = await _run_json(
+        host,
+        "lsblk", "--json", "--bytes", "--output",
+        "NAME,PATH,PKNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL"
     )
 
-    if not isinstance(lsblk, dict) or not isinstance(findmnt, dict):
-        raise LinuxRequestError(f"Linux host {host!r} returned invalid storage information")
+    if not isinstance(data, dict):
+        raise LinuxRequestError(f"Linux host {host!r} returned invalid block-device information")
 
-    block_devices = [
-        LinuxBlockDevice(
-            name=str(item.get("name", "")),
-            path=str(item.get("path", "")),
-            type=str(item.get("type", "")),
-            size_bytes=int(item.get("size") or 0),
-            filesystem=(
-                str(item["fstype"])
-                if item.get("fstype")
-                else None
-            ),
-            mountpoints=[
-                str(value)
-                for value in (item.get("mountpoints") or [])
-                if value
-            ],
-        )
-        for item in _flatten(lsblk.get("blockdevices") or [])
-        if str(item.get("type", "")) != "loop"
-    ]
+    devices = []
 
-    filesystems: list[LinuxFilesystem] = []
-
-    for item in _flatten(findmnt.get("filesystems") or []):
-        if str(item.get("fstype", "")) in _PSEUDO_FILESYSTEMS:
+    for item in _flatten(data.get("blockdevices") or []):
+        if str(item.get("type", "")) == "loop":
             continue
 
-        usage = str(item.get("use%") or "0").removesuffix("%")
+        devices.append(pick(
+            item,
+            "name", "path", "pkname", "type", "size", "fstype", "mountpoints", "model", "serial"
+        ))
 
-        filesystems.append(
-            LinuxFilesystem(
-                source=str(item.get("source", "")),
-                target=str(item.get("target", "")),
-                filesystem=str(item.get("fstype", "")),
-                size_bytes=int(item.get("size") or 0),
-                used_bytes=int(item.get("used") or 0),
-                available_bytes=int(item.get("avail") or 0),
-                usage_ratio=float(usage or 0) / 100,
-                read_only=("ro" in str(item.get("options", "")).split(",")),
-            )
-        )
+    devices.sort(key=lambda item: str(item.get("path", "")))
 
-    block_devices.sort(key=lambda item: item.path)
-    filesystems.sort(key=lambda item: item.target)
+    return {"block_devices": devices}
 
-    return LinuxStorage(
-        host=host,
-        block_devices=block_devices,
-        filesystems=filesystems,
+
+async def list_linux_filesystems(
+    host: HostRef,
+) -> dict[str, Any]:
+    """
+    List mounted filesystems on one Linux host.
+
+    Upstream command:
+    findmnt --json --bytes --df --output SOURCE,TARGET,FSTYPE,SIZE,USED,AVAIL,USE%,OPTIONS
+
+    Pseudo-filesystems such as proc, sysfs, tmpfs, and cgroup are omitted.
+    """
+    data = await _run_json(
+        host,
+        "findmnt",
+        "--json", "--bytes", "--df", "--output",
+        "SOURCE,TARGET,FSTYPE,SIZE,USED,AVAIL,USE%,OPTIONS",
     )
 
+    if not isinstance(data, dict):
+        raise LinuxRequestError(f"Linux host {host!r} returned invalid filesystem information")
 
-async def get_linux_network(host: str) -> LinuxNetwork:
-    """Get interfaces, routes, DNS servers, and listening sockets for a Linux host."""
-    addresses, route_data, sockets, resolv_conf = await asyncio.gather(
-        _run_json(host, "ip", "-json", "address", "show"),
-        _run_json(host, "ip", "-json", "route", "show", "table", "main"),
-        _run(host, "ss", "-H", "-lntu"),
-        _run(host, "cat", "/etc/resolv.conf", check=False),
-    )
-
-    if not isinstance(addresses, list) or not isinstance(route_data, list):
-        raise LinuxRequestError(f"Linux host {host!r} returned invalid network information")
-
-    interfaces = [
-        LinuxInterface(
-            name=str(item.get("ifname", "")),
-            state=str(item.get("operstate", "")),
-            mtu=int(item.get("mtu") or 0),
-            mac_address=(
-                str(item["address"])
-                if item.get("address")
-                else None
-            ),
-            addresses=[
-                f"{address['local']}/{address['prefixlen']}"
-                for address in item.get("addr_info", [])
-                if address.get("local") is not None
-                and address.get("prefixlen") is not None
-            ],
+    filesystems = [
+        pick(
+            item,
+            "source", "target", "fstype", "size", "used", "avail", "use%", "options"
         )
-        for item in addresses
-        if not _virtual_interface(str(item.get("ifname", "")))
+        for item in _flatten(data.get("filesystems") or [])
+        if str(item.get("fstype", "")) not in _PSEUDO_FILESYSTEMS
     ]
+
+    filesystems.sort(key=lambda item: str(item.get("target", "")))
+
+    return {"filesystems": filesystems}
+
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+
+async def list_linux_interfaces(
+    host: HostRef,
+) -> dict[str, Any]:
+    """
+    List network interfaces and assigned addresses on one Linux host.
+
+    Upstream command:
+    ip -json address show
+    """
+    data = await _run_json(
+        host,
+        "ip", "-json", "address", "show",
+    )
+
+    if not isinstance(data, list):
+        raise LinuxRequestError(
+            f"Linux host {host!r} returned invalid interface information"
+        )
+
+    interfaces = []
+
+    for item in data:
+        interfaces.append({
+            **pick(
+                item,
+                "ifindex", "ifname", "flags", "mtu", "qdisc", "operstate", "group", "link_type", 
+                "address", "broadcast", "master",
+            ),
+            "addr_info": [
+                pick(
+                    address,
+                    "family", "local", "prefixlen", "broadcast", "scope", "label", "dynamic", 
+                    "deprecated", "valid_life_time", "preferred_life_time"
+                )
+                for address in (item.get("addr_info") or [])
+            ],
+        })
+
+    interfaces.sort(key=lambda item: str(item.get("ifname", "")))
+
+    return {"interfaces": interfaces}
+
+
+async def list_linux_routes(
+    host: HostRef,
+) -> dict[str, Any]:
+    """
+    List routes from the main routing table on one Linux host.
+
+    Upstream command:
+    ip -json route show table main
+    """
+    data = await _run_json(
+        host,
+        "ip", "-json", "route", "show", "table", "main",
+    )
+
+    if not isinstance(data, list):
+        raise LinuxRequestError(
+            f"Linux host {host!r} returned invalid route information"
+        )
 
     routes = [
-        LinuxRoute(
-            destination=str(item.get("dst", "default")),
-            gateway=(
-                str(item["gateway"])
-                if item.get("gateway")
-                else None
-            ),
-            device=(
-                str(item["dev"])
-                if item.get("dev")
-                else None
-            ),
-            source=(
-                str(item["prefsrc"])
-                if item.get("prefsrc")
-                else None
-            ),
-            metric=(
-                int(item["metric"])
-                if item.get("metric") is not None
-                else None
-            ),
+        pick(
+            item,
+            "dst", "gateway", "dev", "prefsrc", "metric", "protocol", "scope", "type"
         )
-        for item in route_data
-        if not _virtual_interface(str(item.get("dev", "")))
+        for item in data
     ]
 
-    listeners: list[LinuxListener] = []
+    routes.sort(key=lambda item: (
+        str(item.get("dst", "default")),
+        str(item.get("dev", "")),
+        str(item.get("gateway", "")),
+    ))
 
-    for line in sockets.splitlines():
+    return {"routes": routes}
+
+
+async def list_linux_listeners(
+    host: HostRef,
+) -> dict[str, Any]:
+    """
+    List listening TCP and UDP sockets on one Linux host.
+
+    Upstream command:
+    ss -H -lntu
+    """
+    output = await _run(
+        host,
+        "ss", "-H", "-lntu",
+    )
+
+    listeners = []
+
+    for line in output.splitlines():
         fields = line.split()
 
         if len(fields) < 5:
@@ -511,67 +358,98 @@ async def get_linux_network(host: str) -> LinuxNetwork:
         except ValueError:
             continue
 
-        listeners.append(
-            LinuxListener(
-                protocol=fields[0],
-                address=address,
-                port=port,
-            )
-        )
+        listeners.append({
+            "protocol": fields[0],
+            "state": fields[1],
+            "address": address,
+            "port": port,
+        })
 
-    interfaces.sort(key=lambda item: item.name)
-    routes.sort(key=lambda item: (
-        item.destination,
-        item.device or "",
-        item.gateway or "",
-    ))
     listeners.sort(key=lambda item: (
-        item.port,
-        item.protocol,
-        item.address,
+        item["port"],
+        item["protocol"],
+        item["address"],
     ))
 
-    return LinuxNetwork(
-        host=host,
-        interfaces=interfaces,
-        routes=routes,
-        dns_servers=_dns_servers(resolv_conf),
-        listeners=listeners,
+    return {"listeners": listeners}
+
+
+async def get_linux_resolver(
+    host: HostRef,
+) -> dict[str, Any]:
+    """
+    Get resolver configuration from one Linux host.
+
+    Upstream command:
+    cat /etc/resolv.conf
+    """
+    output = await _run(
+        host,
+        "cat", "/etc/resolv.conf",
+        check=False,
     )
 
+    nameservers: list[str] = []
+    search: list[str] = []
+    domain: str | None = None
+    options: list[str] = []
+
+    for line in output.splitlines():
+        line = line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        fields = line.split()
+
+        if not fields:
+            continue
+
+        if fields[0] == "nameserver" and len(fields) >= 2:
+            nameservers.append(fields[1])
+
+        elif fields[0] == "search":
+            search.extend(fields[1:])
+
+        elif fields[0] == "domain" and len(fields) >= 2:
+            domain = fields[1]
+
+        elif fields[0] == "options":
+            options.extend(fields[1:])
+
+    return {
+        "nameservers": nameservers,
+        "search": search,
+        "domain": domain,
+        "options": options,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
 
 async def list_linux_packages(
-    host: str,
-    manual_only: bool = False,
-) -> LinuxPackages:
+    host: HostRef,
+) -> dict[str, Any]:
     """
-    List installed Debian packages on a Linux host.
+    List installed Debian packages on one Linux host.
 
-    Includes automatic/manual installation state and package holds.
-    Set manual_only to omit automatically installed dependencies.
+    Upstream command:
+    dpkg-query --show --showformat=...
+
+    Automatic/manual state and package holds are available through the separate
+    apt-mark tools.
     """
-    package_output, automatic_output, held_output = await asyncio.gather(
-        _run(
-            host,
-            "dpkg-query",
-            "--show",
-            "--showformat=${binary:Package}\\t${Version}\\t${Architecture}\\t"
-            "${db:Status-Status}\\t${binary:Synopsis}\\n",
-        ),
-        _run(host, "apt-mark", "showauto"),
-        _run(host, "apt-mark", "showhold"),
+    output = await _run(
+        host,
+        "dpkg-query", "--show", "--showformat=${binary:Package}\\t${Version}\\t${Architecture}\\t"
+        "${db:Status-Status}\\t${binary:Synopsis}\\n",
     )
 
-    automatic = set(automatic_output.splitlines())
-    held = set(held_output.splitlines())
+    packages = []
 
-    def marked(name: str, values: set[str]) -> bool:
-        base_name = name.partition(":")[0]
-        return name in values or base_name in values
-
-    packages: list[LinuxPackage] = []
-
-    for line in package_output.splitlines():
+    for line in output.splitlines():
         fields = line.split("\t", 4)
 
         if len(fields) != 5:
@@ -582,46 +460,89 @@ async def list_linux_packages(
         if status != "installed":
             continue
 
-        is_automatic = marked(name, automatic)
+        packages.append({
+            "name": name,
+            "version": version,
+            "architecture": architecture,
+            "synopsis": redact_text(synopsis),
+        })
 
-        if manual_only and is_automatic:
-            continue
+    packages.sort(key=lambda package: package["name"])
 
-        packages.append(
-            LinuxPackage(
-                name=name,
-                version=version,
-                architecture=architecture,
-                automatic=is_automatic,
-                held=marked(name, held),
-                synopsis=redact_text(synopsis),
-            )
-        )
-
-    packages.sort(key=lambda package: package.name)
-
-    return LinuxPackages(
-        host=host,
-        packages=packages,
-    )
+    return {"packages": packages}
 
 
-async def list_linux_units(
-    host: str,
-    type: UnitType = "service",
-    state: UnitState = "active",
-) -> LinuxUnits:
+async def list_linux_automatic_packages(
+    host: HostRef,
+) -> dict[str, Any]:
     """
-    List loaded systemd units on a Linux host.
+    List packages marked as automatically installed.
 
-    Defaults to active services. Select another unit type or state as needed.
+    Upstream command:
+    apt-mark showauto
     """
     output = await _run(
-        host, "systemctl", "--plain", "--no-legend", "--no-pager", "--full", "list-units", 
-        f"--type={type}", "--all"
+        host,
+        "apt-mark", "showauto",
     )
 
-    units: list[LinuxUnit] = []
+    return {
+        "packages": sorted(
+            line.strip()
+            for line in output.splitlines()
+            if line.strip()
+        )
+    }
+
+
+async def list_linux_held_packages(
+    host: HostRef,
+) -> dict[str, Any]:
+    """
+    List packages held at their current version.
+
+    Upstream command:
+    apt-mark showhold
+    """
+    output = await _run(
+        host,
+        "apt-mark", "showhold",
+    )
+
+    return {
+        "packages": sorted(
+            line.strip()
+            for line in output.splitlines()
+            if line.strip()
+        )
+    }
+
+
+# ---------------------------------------------------------------------------
+# systemd
+# ---------------------------------------------------------------------------
+
+async def list_linux_units(
+    host: HostRef,
+    type: UnitType = "service",
+    state: UnitState = "active",
+) -> dict[str, Any]:
+    """
+    List loaded systemd units on one Linux host.
+
+    Upstream command:
+    systemctl --plain --no-legend --no-pager --full list-units --type={type} --all
+
+    Defaults to active services. `state` filters the returned unit state without
+    making another command request.
+    """
+    output = await _run(
+        host,
+        "systemctl", "--plain", "--no-legend", "--no-pager", "--full", "list-units", 
+        f"--type={type}", "--all",
+    )
+
+    units = []
 
     for line in output.splitlines():
         line = line.lstrip()
@@ -634,44 +555,46 @@ async def list_linux_units(
         if len(fields) < 4:
             continue
 
-        units.append(
-            LinuxUnit(
-                name=fields[0],
-                load_state=fields[1],
-                active_state=fields[2],
-                sub_state=fields[3],
-                description=(
-                    redact_text(fields[4])
-                    if len(fields) == 5
-                    else ""
-                ),
-            )
-        )
+        item = {
+            "name": fields[0],
+            "load_state": fields[1],
+            "active_state": fields[2],
+            "sub_state": fields[3],
+            "description": (
+                redact_text(fields[4])
+                if len(fields) == 5
+                else ""
+            ),
+        }
 
-    units = [
-        unit for unit in units
-        if unit.load_state == "loaded"
-        and (state == "all" or unit.active_state == state)
-    ]
+        if item["load_state"] != "loaded":
+            continue
 
-    units.sort(key=lambda unit: unit.name)
+        if state != "all" and item["active_state"] != state:
+            continue
 
-    return LinuxUnits(
-        host=host,
-        units=units,
-    )
+        units.append(item)
+
+    units.sort(key=lambda unit: unit["name"])
+
+    return {"units": units}
 
 
 async def get_linux_unit(
-    host: str,
+    host: HostRef,
     unit: UnitRef,
-) -> LinuxUnitDetails:
-    """Get state and configuration provenance for one systemd unit."""
+) -> dict[str, Any]:
+    """
+    Get state and configuration provenance for one systemd unit.
+
+    Upstream command:
+    systemctl --no-pager --property=... show {unit}
+    """
     output = await _run(
-        host, "systemctl", "--no-pager", 
-        "--property=" "Id,Description,LoadState,ActiveState,SubState," 
-        "UnitFileState,UnitFilePreset,FragmentPath,SourcePath," "DropInPaths,NeedDaemonReload", 
-        "show", unit,
+        host,
+        "systemctl", "--no-pager", "--property=Id,Description,LoadState,ActiveState,SubState,"
+        "UnitFileState,UnitFilePreset,FragmentPath,SourcePath,DropInPaths,NeedDaemonReload",
+        "show", unit
     )
 
     properties = dict(
@@ -680,34 +603,31 @@ async def get_linux_unit(
         if "=" in line
     )
 
-    return LinuxUnitDetails(
-        host=host,
-        name=properties.get("Id", unit),
-        description=redact_text(properties.get("Description", "")),
-        load_state=properties.get("LoadState", ""),
-        active_state=properties.get("ActiveState", ""),
-        sub_state=properties.get("SubState", ""),
-        unit_file_state=properties.get("UnitFileState") or None,
-        unit_file_preset=properties.get("UnitFilePreset") or None,
-        fragment_path=properties.get("FragmentPath") or None,
-        source_path=properties.get("SourcePath") or None,
-        drop_in_paths=properties.get("DropInPaths", "").split(),
-        need_daemon_reload=(properties.get("NeedDaemonReload") == "yes"),
+    result = pick(
+        properties,
+        "Id", "Description", "LoadState", "ActiveState", "SubState", "UnitFileState", 
+        "UnitFilePreset", "FragmentPath", "SourcePath", "DropInPaths", "NeedDaemonReload"
     )
 
+    return redact_value(result)
 
-async def get_linux_unit_files(
-    host: str,
-    type: UnitType = "service"
-) -> LinuxUnitFiles:
-    """List installed systemd unit files and their enablement state."""
 
+async def list_linux_unit_files(
+    host: HostRef,
+    type: UnitType = "service",
+) -> dict[str, Any]:
+    """
+    List installed systemd unit files and their enablement state.
+
+    Upstream command:
+    systemctl --no-legend --no-pager --full list-unit-files --type={type}
+    """
     output = await _run(
-        host, "systemctl", "--no-legend", "--no-pager", "--full", "list-unit-files", 
-        f"--type={type}"
+        host,
+        "systemctl", "--no-legend", "--no-pager", "--full", "list-unit-files", f"--type={type}"
     )
 
-    unit_files: list[LinuxUnitFile] = []
+    unit_files = []
 
     for line in output.splitlines():
         fields = line.split()
@@ -715,40 +635,43 @@ async def get_linux_unit_files(
         if len(fields) < 2:
             continue
 
-        unit_files.append(
-            LinuxUnitFile(
-                name=fields[0],
-                state=fields[1],
-                preset=(
-                    fields[2]
-                    if len(fields) >= 3 and fields[2] != "-"
-                    else None
-                ),
-            )
-        )
+        unit_files.append({
+            "name": fields[0],
+            "state": fields[1],
+            "preset": (
+                fields[2]
+                if len(fields) >= 3 and fields[2] != "-"
+                else None
+            ),
+        })
 
-    unit_files.sort(key=lambda item: item.name)
+    unit_files.sort(key=lambda item: item["name"])
 
-    return LinuxUnitFiles(
-        host=host,
-        unit_files=unit_files,
-    )
+    return {"unit_files": unit_files}
 
+
+# ---------------------------------------------------------------------------
+# Kernel configuration
+# ---------------------------------------------------------------------------
 
 async def get_linux_sysctls(
-    host: str,
+    host: HostRef,
     prefix: SysctlPrefix,
-) -> LinuxSysctls:
+) -> dict[str, Any]:
     """
     Get current kernel sysctl values below a prefix.
 
-    The prefix must use dotted sysctl notation, such as "net.ipv4" or "vm".
+    Upstream command:
+    sysctl --all --pattern {prefix}
     """
     pattern = "^" + prefix.replace(".", r"\.") + r"(\.|$)"
 
-    output = await _run(host, "sysctl", "--all", "--pattern", pattern)
+    output = await _run(
+        host,
+        "sysctl", "--all", "--pattern", pattern,
+    )
 
-    values: list[LinuxSysctl] = []
+    values = []
 
     for line in output.splitlines():
         key, separator, value = line.partition("=")
@@ -756,38 +679,56 @@ async def get_linux_sysctls(
         if not separator:
             continue
 
-        values.append(
-            LinuxSysctl(
-                key=key.strip(),
-                value=redact_text(value.strip()),
-            )
-        )
+        values.append({
+            "key": key.strip(),
+            "value": redact_text(value.strip()),
+        })
 
-    values.sort(key=lambda item: item.key)
+    values.sort(key=lambda item: item["key"])
 
-    return LinuxSysctls(
-        host=host,
-        prefix=prefix,
-        values=values,
-    )
+    return {"values": values}
+
+
+# ---------------------------------------------------------------------------
+# Approved configuration files
+# ---------------------------------------------------------------------------
+
+async def list_linux_files() -> dict[str, Any]:
+    """
+    List configuration-file paths approved for read_linux_file.
+
+    Source: server-side LINUX_FILES configuration.
+
+    No SSH command is run.
+    """
+    return {
+        "paths": sorted(_files),
+        "max_file_bytes": _MAX_FILE_BYTES,
+    }
 
 
 async def read_linux_file(
-    host: str,
-    path: str,
-) -> LinuxFile:
+    host: HostRef,
+    path: LinuxFileRef,
+) -> dict[str, Any]:
     """
-    Attempt to read one explicitly approved configuration file.
+    Read one explicitly approved Linux configuration file.
 
-    The path must exactly match an entry in LINUX_FILES. Returns file metadata even when the 
-    configured SSH account cannot read the content. Text content is bounded and redacted before
-    being returned.
+    Safety exception: this tool intentionally uses two commands.
+
+    Upstream commands:
+    stat --dereference --printf=... -- {path}
+    head --bytes=131073 -- {path}
+
+    The path must exactly match an entry returned by list_linux_files. File type
+    and size are checked before reading. Content is bounded and redacted.
     """
     if path not in _files:
         raise RuntimeError(f"File path {path!r} is not approved")
 
     metadata = await _run(
-        host, "stat", "--dereference", r"--printf=%F\n%s\n%a\n%u\n%g\n%U\n%G\n%Y\n", "--", path
+        host,
+        "stat", "--dereference", r"--printf=%F\n%s\n%a\n%u\n%g\n%U\n%G\n%Y\n", "--", path,
     )
 
     fields = metadata.splitlines()
@@ -797,7 +738,16 @@ async def read_linux_file(
             f"Linux host {host!r} returned invalid stat information for {path!r}"
         )
 
-    file_type, raw_size, raw_mode, raw_uid, raw_gid, owner, group, raw_modified = fields
+    (
+        file_type,
+        raw_size,
+        raw_mode,
+        raw_uid,
+        raw_gid,
+        owner,
+        group,
+        raw_modified,
+    ) = fields
 
     try:
         size_bytes = int(raw_size)
@@ -811,6 +761,7 @@ async def read_linux_file(
             f"Linux host {host!r} returned invalid stat information for {path!r}"
         ) from exc
 
+    raw_content: str | None = None
     content: str | None = None
     read_error: str | None = None
 
@@ -822,7 +773,10 @@ async def read_linux_file(
 
     else:
         try:
-            raw_content = await _run(host, "head", f"--bytes={_MAX_FILE_BYTES + 1}", "--", path)
+            raw_content = await _run(
+                host,
+                "head", f"--bytes={_MAX_FILE_BYTES + 1}", "--", path
+            )
 
             if len(raw_content.encode()) > _MAX_FILE_BYTES:
                 read_error = "File exceeded the size limit while being read"
@@ -836,31 +790,43 @@ async def read_linux_file(
         except LinuxRequestError as exc:
             read_error = str(exc)
 
-    return LinuxFile(
-        host=host,
-        path=path,
-        file_type=file_type,
-        size_bytes=size_bytes,
-        mode=mode,
-        uid=uid,
-        gid=gid,
-        owner=owner,
-        group=group,
-        modified_at_epoch=modified_at_epoch,
-        content=content,
-        redacted=(content is not None and content != raw_content),
-        read_error=read_error
-    )
+    return {
+        "path": path,
+        "file_type": file_type,
+        "size_bytes": size_bytes,
+        "mode": mode,
+        "uid": uid,
+        "gid": gid,
+        "owner": owner,
+        "group": group,
+        "modified_at_epoch": modified_at_epoch,
+        "content": content,
+        "redacted": (
+            raw_content is not None
+            and content is not None
+            and content != raw_content
+        ),
+        "read_error": read_error,
+    }
 
 
 TOOLS = (
     list_linux_hosts,
-    get_linux_storage,
-    get_linux_network,
+    get_linux_host,
+    list_linux_block_devices,
+    list_linux_filesystems,
+    list_linux_interfaces,
+    list_linux_routes,
+    list_linux_listeners,
+    get_linux_resolver,
     list_linux_packages,
+    list_linux_automatic_packages,
+    list_linux_held_packages,
     list_linux_units,
     get_linux_unit,
-    get_linux_unit_files,
+    list_linux_unit_files,
     get_linux_sysctls,
+    list_linux_files,
     read_linux_file,
 )
+
