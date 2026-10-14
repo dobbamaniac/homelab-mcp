@@ -244,8 +244,73 @@ async def get_zfs_properties(
     }
 
 
+async def list_zfs_snapshots(
+    dataset: DatasetRef,
+    recursive: bool = True,
+    limit: Annotated[int, Field(ge=1, le=500)] = 100,
+) -> dict[str, Any]:
+    """
+    List ZFS snapshots, newest first.
+
+    Upstream command:
+    zfs list -Hp -t snapshot -o name,creation,used,referenced -S creation -r {dataset}
+
+    Results are bounded. Use a specific dataset to limit
+    the upstream output.
+    """
+    host = _host()
+
+    output = await _run(
+        host,
+        "zfs", "list",
+        "-Hp",
+        "-t", "snapshot",
+        "-o", "name,creation,used,referenced",
+        "-S", "creation",
+        "-r", dataset,
+    )
+
+    snapshots = []
+    has_more = False
+
+    for line in output.splitlines():
+        fields = line.split("\t")
+
+        if len(fields) != 4:
+            continue
+
+        name, creation, used, referenced = fields
+
+        parent = name.split("@", 1)[0]
+
+        if not recursive and parent != dataset:
+            continue
+
+        if len(snapshots) >= limit:
+            has_more = True
+            break
+
+        snapshots.append({
+            "name": name,
+            "dataset": parent,
+            "created_at_epoch": int(creation),
+            "used_bytes": int(used),
+            "referenced_bytes": int(referenced),
+        })
+
+    return {
+        "host": host,
+        "dataset": dataset,
+        "recursive": recursive,
+        "limit": limit,
+        "has_more": has_more,
+        "snapshots": snapshots,
+    }
+
+
 TOOLS = (
     list_zfs_pools,
     list_zfs_datasets,
     get_zfs_properties,
+    list_zfs_snapshots,
 )

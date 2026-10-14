@@ -612,6 +612,120 @@ async def get_linux_unit(
     return redact_value(result)
 
 
+
+# Directives safe to expose by default.
+# Unknown directives are omitted rather than returned verbatim.
+_UNIT_SAFE_DIRECTIVES = {
+    "Unit": {
+        "Description", "After", "Before", "Wants", "Requires",
+        "BindsTo", "PartOf", "Conflicts",
+        "ConditionPathExists", "ConditionPathIsDirectory",
+    },
+    "Service": {
+        "Type", "User", "Group", "WorkingDirectory",
+        "Restart", "RestartSec", "RemainAfterExit",
+        "TimeoutStartSec", "TimeoutStopSec",
+        "NoNewPrivileges", "PrivateTmp",
+        "ProtectSystem", "ProtectHome",
+    },
+    "Timer": {
+        "OnCalendar", "OnBootSec", "OnActiveSec",
+        "OnUnitActiveSec", "OnUnitInactiveSec",
+        "AccuracySec", "RandomizedDelaySec",
+        "Persistent", "Unit",
+    },
+    "Install": {
+        "WantedBy", "RequiredBy", "Also", "Alias",
+    },
+}
+
+
+async def get_linux_unit_definition(
+    host: HostRef,
+    unit: UnitRef,
+) -> dict[str, Any]:
+    """
+    Inspect a systemd unit and its drop-ins.
+
+    Upstream command:
+    systemctl --no-pager cat {unit}
+
+    Returns selected configuration directives and their
+    source files. Potentially sensitive directives and
+    multiline values are omitted.
+    """
+    output = await _run(
+        host,
+        "systemctl", "--no-pager", "cat", unit,
+    )
+
+    if len(output.encode()) > 64 * 1024:
+        raise LinuxRequestError(f"Systemd unit {unit!r} exceeds the output limit")
+
+    sources = []
+    directives = []
+    omitted = set()
+
+    source = None
+    section = None
+    continuation = False
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+
+        if line.startswith("# /"):
+            source = line[2:]
+            sources.append(source)
+            section = None
+            continuation = False
+            continue
+
+        if not line or line.startswith("#"):
+            continue
+
+        if continuation:
+            continuation = line.endswith("\\")
+            continue
+
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+
+        key, separator, value = line.partition("=")
+
+        if not separator:
+            continue
+
+        key = key.strip()
+        value = value.strip()
+
+        if value.endswith("\\"):
+            omitted.add(key)
+            continuation = True
+            continue
+
+        allowed = _UNIT_SAFE_DIRECTIVES.get(section, set())
+
+        if key not in allowed or len(value) > 4096:
+            omitted.add(key)
+            continue
+
+        directives.append({
+            "source": source,
+            "section": section,
+            "name": key,
+            "value": redact_text(value),
+        })
+
+    return {
+        "host": host,
+        "unit": unit,
+        "sources": sources,
+        "directives": directives,
+        "omitted_directives": sorted(omitted),
+    }
+
+
 async def list_linux_unit_files(
     host: HostRef,
     type: UnitType = "service",
@@ -824,6 +938,7 @@ TOOLS = (
     list_linux_held_packages,
     list_linux_units,
     get_linux_unit,
+    get_linux_unit_definition,
     list_linux_unit_files,
     get_linux_sysctls,
     list_linux_files,
