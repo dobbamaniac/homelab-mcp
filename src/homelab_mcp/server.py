@@ -23,6 +23,8 @@ TRANSPORT_SECURITY = TransportSecuritySettings(
     allowed_hosts=[
         "homelab-server",
         "homelab-server:*",
+        "mcp.amotelab.org",
+        "mcp.amotelab.org:*",
     ],
     allowed_origins=[],
 )

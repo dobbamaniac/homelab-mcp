@@ -23,32 +23,29 @@ _hosts: dict[str, str] = {}
 _TIMEOUT = 15.0
 _MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 
-_HOST_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
-_HOST_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
 def _configured_hosts() -> dict[str, str]:
-    value = require_env("SSH_HOSTS")
     hosts: dict[str, str] = {}
 
-    for entry in value.split(","):
-        name, separator, target = entry.partition("=")
-        name = name.strip()
-        target = target.strip()
+    for entry in require_env("SSH_HOSTS").split(","):
+        fqdn = entry.strip().lower().removesuffix(".")
+        labels = fqdn.split(".")
 
-        if not separator or not name or not target:
-            raise RuntimeError("SSH_HOSTS must use name=host entries separated by commas")
+        if (
+            len(fqdn) > 253
+            or len(labels) < 2
+            or not all(_DNS_LABEL.fullmatch(label) for label in labels)
+        ):
+            raise RuntimeError(f"Invalid SSH hostname {entry!r}")
 
-        if not _HOST_REF.fullmatch(name):
-            raise RuntimeError(f"Invalid SSH host name {name!r}")
-
-        if not _HOST_TARGET.fullmatch(target):
-            raise RuntimeError(f"Invalid SSH target {target!r}")
+        name = labels[0]
 
         if name in hosts:
-            raise RuntimeError(f"Duplicate SSH host {name!r}")
+            raise RuntimeError(f"Duplicate SSH hostname {name!r}")
 
-        hosts[name] = target
+        hosts[name] = fqdn
 
     return hosts
 

@@ -419,21 +419,6 @@ async def list_pfsense_virtual_ips() -> dict[str, Any]:
     )}
 
 
-async def get_pfsense_state_table_size() -> dict[str, Any]:
-    """
-    Get pfSense state-table sizing and current state count.
-
-    Upstream: pfSense REST API v2
-    GET /api/v2/firewall/states/size
-    """
-    data = await _get("firewall/states/size")
-
-    return pick(
-        data,
-        "maximumstates", "defaultmaximumstates", "currentstates"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Client discovery
 # ---------------------------------------------------------------------------
@@ -711,7 +696,6 @@ TOOLS = (
     list_pfsense_outbound_nat_mappings,
     list_pfsense_one_to_one_nat_mappings,
     list_pfsense_virtual_ips,
-    get_pfsense_state_table_size,
     list_pfsense_arp_entries,
     list_pfsense_dhcp_leases,
     list_pfsense_dhcp_servers,

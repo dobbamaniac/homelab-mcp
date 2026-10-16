@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import posixpath
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -76,26 +77,59 @@ _PSEUDO_FILESYSTEMS = {
 }
 
 _MAX_FILE_BYTES = 128 * 1024
+_MAX_FILE_MATCHES = 100
+
 
 
 def _configured_files() -> set[str]:
     files: set[str] = set()
 
     for value in require_env("LINUX_FILES").split(","):
-        path = value.strip()
+        pattern = value.strip()
+        directory, name = posixpath.split(pattern)
 
-        if not path:
-            raise RuntimeError("LINUX_FILES contains an empty entry")
+        if (
+            not posixpath.isabs(pattern)
+            or posixpath.normpath(pattern) != pattern
+            or not name
+            or any(c in directory for c in "*?[]")
+            or any(ord(c) < 32 for c in pattern)
+        ):
+            raise RuntimeError(f"Invalid Linux file pattern {pattern!r}")
 
-        if not path.startswith("/") or posixpath.normpath(path) != path:
-            raise RuntimeError(f"LINUX_FILES must contain normalized absolute paths, got {path!r}")
+        if pattern in files:
+            raise RuntimeError(f"Duplicate Linux file pattern {pattern!r}")
 
-        if path in files:
-            raise RuntimeError(f"Duplicate Linux configuration path {path!r}")
-
-        files.add(path)
+        files.add(pattern)
 
     return files
+
+
+def _approved_file(path: str) -> bool:
+    if (
+        not posixpath.isabs(path)
+        or posixpath.normpath(path) != path
+        or not posixpath.basename(path)
+        or any(c in path for c in "*?[]")
+        or any(ord(c) < 32 for c in path)
+    ):
+        return False
+
+    directory, filename = posixpath.split(path)
+
+    for pattern in _files:
+        allowed_dir, allowed_name = posixpath.split(pattern)
+
+        if directory != allowed_dir:
+            continue
+
+        if filename.startswith(".") and not allowed_name.startswith("."):
+            continue
+
+        if fnmatch.fnmatchcase(filename, allowed_name):
+            return True
+
+    return False
 
 
 @asynccontextmanager
@@ -807,16 +841,51 @@ async def get_linux_sysctls(
 # Approved configuration files
 # ---------------------------------------------------------------------------
 
-async def list_linux_files() -> dict[str, Any]:
-    """
-    List configuration-file paths approved for read_linux_file.
 
-    Source: server-side LINUX_FILES configuration.
 
-    No SSH command is run.
+async def list_linux_files(
+    host: HostRef,
+) -> dict[str, Any]:
     """
+    Discover approved configuration files on a Linux host.
+
+    Upstream command:
+    find DIR -maxdepth 1 -type f -name PATTERN -print0
+    """
+    paths: set[str] = set()
+    errors = []
+    truncated = False
+
+    for rule in sorted(_files):
+        directory, pattern = posixpath.split(rule)
+
+        try:
+            output = await _run(
+                host,
+                "find", directory, "-maxdepth", "1", "-type", "f", "-name", pattern, "-print0",
+            )
+        except LinuxRequestError as exc:
+            errors.append({"pattern": rule, "error": str(exc)})
+            continue
+
+        for path in output.split("\0"):
+            if not path or not _approved_file(path):
+                continue
+
+            if len(paths) >= _MAX_FILE_MATCHES and path not in paths:
+                truncated = True
+                break
+
+            paths.add(path)
+
+        if truncated:
+            break
+
     return {
-        "paths": sorted(_files),
+        "host": host,
+        "paths": sorted(paths),
+        "truncated": truncated,
+        "errors": errors,
         "max_file_bytes": _MAX_FILE_BYTES,
     }
 
@@ -826,19 +895,26 @@ async def read_linux_file(
     path: LinuxFileRef,
 ) -> dict[str, Any]:
     """
-    Read one explicitly approved Linux configuration file.
-
-    Safety exception: this tool intentionally uses two commands.
+    Read one configuration file matching an approved LINUX_FILES pattern.
 
     Upstream commands:
+    realpath -e -- {path}
     stat --dereference --printf=... -- {path}
     head --bytes=131073 -- {path}
 
-    The path must exactly match an entry returned by list_linux_files. File type
-    and size are checked before reading. Content is bounded and redacted.
+    The path must be an exact, normalized absolute filename that matches an approved pattern. 
+    Symlinks are rejected, content is size-limited, and returned text is redacted.
     """
-    if path not in _files:
+
+    if not _approved_file(path):
         raise RuntimeError(f"File path {path!r} is not approved")
+
+    resolved = (
+        await _run(host, "realpath", "-e", "--", path)
+    ).strip()
+
+    if resolved != path:
+        raise LinuxRequestError(f"File path {path!r} resolves through a symlink")
 
     metadata = await _run(
         host,

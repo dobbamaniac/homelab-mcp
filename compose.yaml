@@ -1,17 +1,7 @@
 services:
   homelab-server:
     container_name: homelab-server
-    
     build: .
-    restart: unless-stopped
-
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 64
-
     environment:
       PROXMOX_URL: ${PROXMOX_URL:?Set PROXMOX_URL in .env}
       PROXMOX_API_TOKEN: ${PROXMOX_API_TOKEN:?Set PROXMOX_API_TOKEN in .env}
@@ -24,69 +14,91 @@ services:
       LINUX_FILES: ${LINUX_FILES:?Set LINUX_FILES in .env}
       DOCKER_HOSTS: ${DOCKER_HOSTS:?Set DOCKER_HOSTS in .env}
       ZFS_HOSTS: ${ZFS_HOSTS:?Set ZFS_HOSTS in .env}
-
     volumes:
       - ./secrets/ssh_key:/run/secrets/ssh_key:ro
       - ./secrets/known_hosts:/run/secrets/known_hosts:ro
-
     tmpfs:
       - /tmp:size=16m,nosuid,nodev,noexec
-
     networks:
       - homelab-backend
-      - mcp
-      - docker-proxy
-
-
-  homelab-tunnel:
-    container_name: homelab-tunnel
-
-    build:
-      context: "https://github.com/openai/tunnel-client.git#${TUNNEL_CLIENT_VERSION:-v0.0.10}"
-      args:
-        GIT_SHA: ${TUNNEL_CLIENT_VERSION:-v0.0.10}
-
-    image: homelab-tunnel:local
-    restart: unless-stopped
-
-    depends_on:
-      - homelab-server
-
-    read_only: true
-    user: "65532:65532"
+      - homelab-targets
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 128
+    read_only: true
+    pids_limit: 64
+    restart: unless-stopped
 
+  homelab-tunnel:
+    container_name: homelab-tunnel
+    build:
+      context: "https://github.com/openai/tunnel-client.git#${TUNNEL_CLIENT_VERSION:-v0.0.10}"
+      args:
+        GIT_SHA: ${TUNNEL_CLIENT_VERSION:-v0.0.10}
+    image: homelab-tunnel:local
+    command:
+      - --control-plane.api-key=env:CONTROL_PLANE_API_KEY
+      - --control-plane.tunnel-id=${TUNNEL_ID:?Set TUNNEL_ID in .env}
+      - --mcp.server-url=http://homelab-server:8000/mcp
+    user: "65532:65532"
     environment:
       LOG_LEVEL: info
       LOG_FORMAT: json
       HOME: /tmp
       CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:?Set CONTROL_PLANE_API_KEY in .env}
-
-    command:
-      - --control-plane.api-key=env:CONTROL_PLANE_API_KEY
-      - --control-plane.tunnel-id=${TUNNEL_ID:?Set TUNNEL_ID in .env}
-      - --mcp.server-url=http://homelab-server:8000/mcp
-
     tmpfs:
       - /tmp:size=16m,mode=1777
-
     networks:
       - homelab-backend
       - homelab-egress
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    pids_limit: 128
+    depends_on:
+      - homelab-server
+    restart: unless-stopped
+
+
+  cloudflared:
+    container_name: homelab-cloudflared
+    image: cloudflare/cloudflared:latest
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+      - --token-file
+      - /run/secrets/cloudflare_tunnel_token
+    user: "65532:65532"
+    secrets:
+      - cloudflare_tunnel_token
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - homelab-backend
+      - homelab-egress
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    pids_limit: 64
+    depends_on:
+      - homelab-server
+    restart: unless-stopped
 
 networks:
   homelab-backend:
     internal: true
 
-  mcp:
-    external: true
-
-  docker-proxy:
-    external: true
-
   homelab-egress: {}
 
+  homelab-targets:
+    driver: bridge
+
+secrets:
+  cloudflare_tunnel_token:
+    file: ./secrets/cloudflare_tunnel_token
