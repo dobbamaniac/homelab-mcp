@@ -12,19 +12,6 @@ if [[ ! -r "$pubkey" ]]; then
     exit 1
 fi
 
-source_ip="$(
-    hostname -I | 
-    tr ' ' '\n' | 
-    awk '/^172\.16\.1\./ { print; exit }'
-)"
-
-if [[ -z "$source_ip" ]]; then
-    echo "Unable to determine source IP" >&2
-    exit 1
-fi
-
-echo "Provisioning homelab-mcp on $fqdn from $source_ip"
-
 ssh "$fqdn" "
     id homelab-mcp >/dev/null 2>&1 ||
     sudo useradd \
@@ -49,7 +36,7 @@ ssh "$fqdn" "
 "
 
 {
-    printf 'from="%s",restrict ' "$source_ip"
+    printf 'restrict '
     cat "$pubkey"
 } | ssh "$fqdn" '
     sudo tee /etc/ssh/authorized_keys/homelab-mcp >/dev/null
