@@ -63,32 +63,32 @@ services:
     restart: unless-stopped
 
 
-  cloudflared:
-    container_name: homelab-cloudflared
-    image: cloudflare/cloudflared:latest
-    command:
-      - tunnel
-      - --no-autoupdate
-      - run
-      - --token-file
-      - /run/secrets/cloudflare_tunnel_token
-    user: "65532:65532"
-    secrets:
-      - cloudflare_tunnel_token
-    tmpfs:
-      - /tmp:size=16m,mode=1777
-    networks:
-      - homelab-backend
-      - homelab-egress
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    pids_limit: 64
-    depends_on:
-      - homelab-server
-    restart: unless-stopped
+#  cloudflared:
+#    container_name: homelab-cloudflared
+#    image: cloudflare/cloudflared:latest
+#    command:
+#      - tunnel
+#      - --no-autoupdate
+#      - run
+#      - --token-file
+#      - /run/secrets/cloudflare_tunnel_token
+#    user: "65532:65532"
+#    secrets:
+#      - cloudflare_tunnel_token
+#    tmpfs:
+#      - /tmp:size=16m,mode=1777
+#    networks:
+#      - homelab-backend
+#      - homelab-egress
+#    cap_drop:
+#      - ALL
+#    security_opt:
+#      - no-new-privileges:true
+#    read_only: true
+#    pids_limit: 64
+#    depends_on:
+#      - homelab-server
+#    restart: unless-stopped
 
 networks:
   homelab-backend:
