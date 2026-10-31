@@ -22,6 +22,8 @@ services:
     networks:
       - homelab-backend
       - homelab-targets
+    ports:
+      - "172.16.10.10:8001:8000"
     cap_drop:
       - ALL
     security_opt:
